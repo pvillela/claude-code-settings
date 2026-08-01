@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "cleanupPeriodDays": 60,
+  "env": {},
+  "attribution": {
+    "commit": "",
+    "pr": ""
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Edit|Write|MultiEdit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/.claude/global-git-guard.sh"
+          }
+        ]
+      }
+    ]
+  },
+  "permissions": {
+    "allow": [
+      "Bash(./clippy.sh *)",
+      "Bash(./check.sh *)",
+      "Bash(./check-features.sh *)",
+      "Bash(cargo check *)",
+      "Bash(./test.sh *)",
+      "Bash(cargo test *)",
+      "Bash(cargo clippy *)",
+      "Bash(echo \"=== exit: $?\")",
+      "Bash(grep *)",
+      "Bash(npx markdownlint *)",
+      "Read(//tmp/**)"
+    ],
+    "deny": [
+      "Bash(git commit *)",
+      "Bash(git push *)",
+      "Read(.env)"
+    ]
+  },
+  "model": "opus",
+  "statusLine": {
+    "type": "command",
+    "command": "bash ~/.claude/statusline-command.sh"
+  },
+  "theme": "dark",
+  "preferredNotifChannel": "terminal_bell"
+}

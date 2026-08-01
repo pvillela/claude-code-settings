@@ -1,0 +1,17 @@
+# 1. Ignore absolutely everything
+*
+
+# 2. Allow the directories themselves so Git can look inside them
+!*/
+!**/
+
+# 3. Re-include explicit list of allowed files or folders
+!.gitignore
+!skills/**
+!CLAUDE.md
+!global-git-guard.sh
+!LICENSE
+!README.md
+!settings.json
+!statusline-command.sh
+
