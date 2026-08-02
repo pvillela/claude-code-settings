@@ -31,6 +31,9 @@ for pair in "$D:main" "$A:aicode"; do
   echo hi > "$dir/tracked.txt"
   git -C "$dir" add -A
   git -C "$dir" -c user.name=t -c user.email=t@t commit -qm init
+  # Present in the working tree but never added: rule 2a's subject.
+  echo loose > "$dir/untracked.txt"
+  echo loose > "$dir/ignored-dir/untracked-but-ignored.md"
 done
 
 pass=0; fail=0
@@ -123,6 +126,18 @@ echo "== rules 2 and 4: file writes =="
 runw "$D" "$D/tracked.txt" deny
 runw "$D" "$D/new.txt" deny
 runw "$A" "$A/tracked.txt" ALLOW
+echo "== rule 2a: existing untracked files, refused on EVERY branch =="
+runw "$A" "$A/untracked.txt" deny
+runw "$D" "$D/untracked.txt" deny
+echo "== rule 2a: creating a new file is not covered =="
+runw "$A" "$A/brand-new.rs" ALLOW
+runw "$A" "$A/nested/deep/brand-new.rs" ALLOW
+echo "== rule 2a: tracked files stay editable on an allowed branch =="
+runw "$A" "$A/tracked.txt" ALLOW
+echo "== rule 2a: an ignored file is exempt even though it is untracked =="
+runw "$A" "$A/ignored-dir/untracked-but-ignored.md" ALLOW
+runw "$D" "$D/ignored-dir/untracked-but-ignored.md" ALLOW
+
 echo "== rule 4 carve-out: paths the repo ignores =="
 runw "$D" "$D/ignored-dir/memory.md" ALLOW
 runw "$D" "$D/debug.log" ALLOW

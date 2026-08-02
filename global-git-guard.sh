@@ -23,6 +23,13 @@
 #          executable bit but not ownership, so the damage can be invisible in
 #          'git status'. Like rule 5a this runs ahead of the branch logic.
 #
+#   2a. Also branch-independent: an EXISTING file in the repo that git does not
+#      track may not be overwritten, on allowed branches as much as disallowed
+#      ones. Git holds no copy, so the overwrite cannot be reviewed or undone.
+#      Creating a file is not covered -- a path that does not exist yet destroys
+#      nothing, and every new file is untracked until it is added. Ignored files
+#      are exempt via rule 4's carve-out, which is checked first.
+#
 #   4. The test is whether the WORKING TREE is affected, not whether git would
 #      notice. A scratch or throwaway file is not exempt. The one carve-out is
 #      a path the repo itself ignores -- see the check-ignore test below, which
@@ -332,6 +339,26 @@ CURRENT_BRANCH=$(git -C "$CONTEXT_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null)
 # ignored path is still handled by the content rules below.
 if [ -n "$FILE_PATH" ] && git -C "$CONTEXT_DIR" check-ignore -q -- "$FILE_PATH" 2>/dev/null; then
   allow
+fi
+
+# Rule 2a: an EXISTING file inside the repo that git does not track may not be
+# overwritten, on any branch, allowed ones included. Git holds no copy of it, so
+# an overwrite is unrecoverable -- no diff to review, nothing to check out, no
+# earlier version anywhere. A tracked file is the opposite: every previous state
+# is retrievable, which is what makes editing it safe.
+#
+# CREATING a file is not covered. A path that does not exist yet destroys
+# nothing, and every new file is untracked until it is added, so refusing those
+# would mean never being able to add a source file, test or document.
+#
+# Order matters twice over. This runs after the ignore carve-out above, because
+# ignored files are untracked too and would otherwise be caught here -- that
+# would re-break the memory store the carve-out exists to permit. And it runs
+# before the allowed-branch check below, because being on an allowed branch does
+# not give git a copy of the file.
+if [ -n "$FILE_PATH" ] && [ -e "$FILE_PATH" ] &&
+   ! git -C "$CONTEXT_DIR" ls-files --error-unmatch -- "$FILE_PATH" >/dev/null 2>&1; then
+  emit deny "Blocked: '$FILE_PATH' exists under $TOPLEVEL but is not tracked by git, so overwriting it cannot be reviewed or undone -- there is no committed version to fall back on. This applies on every branch. Ask the user whether to track it first, or leave it alone."
 fi
 
 ALLOWED_FILE="$TOPLEVEL/.claude/allowed-branches"
