@@ -338,8 +338,8 @@ CURRENT_BRANCH=$(git -C "$CONTEXT_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null)
 # .devcontainer/devcontainer.env -- and exempting those meant they could be
 # overwritten silently, with no diff and nothing to recover from. Ignored files
 # outside ~/.claude are now covered by rule 2a like any other untracked file.
+CLAUDE_HOME=$(realpath -m -- "${CLAUDE_CONFIG_DIR:-$HOME/.claude}" 2>/dev/null)
 if [ -n "$FILE_PATH" ]; then
-  CLAUDE_HOME=$(realpath -m -- "${CLAUDE_CONFIG_DIR:-$HOME/.claude}" 2>/dev/null)
   FILE_ABS=$(realpath -m -- "$FILE_PATH" 2>/dev/null)
   case "$FILE_ABS/" in
     "$CLAUDE_HOME"/*)
@@ -378,6 +378,84 @@ else
   ALLOWED="aicode"
 fi
 
+# Shell commands that rewrite file content: the writing utilities, an in-place
+# sed, and any output redirection. The leading [^0-9>] excludes '2>&1', so an
+# ordinary '2>/dev/null' does not match.
+CONTENT_RE='(^|[;&|[:space:]])(rm|mv|cp|dd|truncate|tee|install|shred)[[:space:]]|sed[[:space:]]+[^|]*-i|[^0-9>]>>?[[:space:]]*[^&[:space:]]'
+
+# Collects the arguments that resolve to paths inside the repo into REPO_TARGETS.
+# Command names and flag values are skipped, and a token counts only if it looks
+# like a path or actually exists, so 'install -m 755 ...' is not fooled by the
+# mode. Returns 0 when at least one target was found, 1 when none were, and 2
+# when the command hides its targets from static inspection.
+REPO_TARGETS=()
+collect_repo_targets() {
+  local seg tok first resolved is_sed found=0
+  # 'cd' can move the base of every relative path -- treat as unresolvable.
+  echo "$COMMAND" | grep -qE '(^|[;&|[:space:]])cd[[:space:]]' && return 2
+  # Substitutions and globs hide their targets from static inspection.
+  echo "$COMMAND" | grep -qE '\$\(|`|\$[A-Za-z_{]|\*|\?' && return 2
+  while IFS= read -r seg; do
+    first=1
+    is_sed=0
+    echo "$seg" | grep -qE '(^|[[:space:]])sed([[:space:]]|$)' && is_sed=1
+    for tok in $(echo "$seg" | tr '<>' '  '); do
+      tok=${tok#[\"\']}; tok=${tok%[\"\']}
+      # a sed script ('s/a/b/', '1,$d') is not a path despite the slashes
+      if [ $is_sed = 1 ]; then
+        case "$tok" in [0-9,\$]*s[/,\|:#]*|s[/,\|:#]*) continue ;; esac
+      fi
+      # skip the command word and common wrappers
+      if [ $first = 1 ]; then
+        case "$tok" in sudo|env|command|xargs|time|nohup) continue ;; esac
+        first=0; continue
+      fi
+      case "$tok" in -*) continue ;; esac
+      # ignore bare words that are neither path-like nor existing files
+      case "$tok" in
+        */*|*.*) ;;
+        *) [ -e "$tok" ] || continue ;;
+      esac
+      resolved=$(realpath -m -- "$tok" 2>/dev/null) || continue
+      case "$resolved/" in "$TOPLEVEL"/*) REPO_TARGETS+=("$resolved"); found=1 ;; esac
+    done
+  done <<EOF
+$(echo "$COMMAND" | tr ';|&' '\n')
+EOF
+  [ "$found" = 1 ] && return 0
+  return 1
+}
+
+# Rule 2a for shell commands. The file tools are checked by path further up;
+# this applies the same rule to 'echo > f', 'cp', 'sed -i' and friends, and like
+# rule 2a it runs on EVERY branch. The classification is deliberately identical
+# to the file-tool one, so that the same write is not permitted through one tool
+# and refused through the other:
+#
+#   target does not exist   creating something, so nothing is destroyed. Left to
+#                           the branch rule below, exactly as a Write to a new
+#                           path is.
+#   exists and untracked    refused on any branch: git holds no copy.
+#   exists and tracked      left to the branch rule below: recoverable.
+#
+# A target that cannot be resolved is asked about rather than refused, because
+# it may well lie outside the repo. Measured against a session's worth of real
+# commands this fires on roughly one in twenty, and on none that only read.
+if [ "$TOOL_NAME" = "Bash" ] && echo "$COMMAND" | grep -qE "$CONTENT_RE"; then
+  collect_repo_targets; content_hit=$?
+  if [ "$content_hit" = 2 ]; then
+    emit ask "This command modifies files and its targets could not be resolved statically -- a variable, glob, substitution or 'cd' hides where it would write. Approve only if it touches nothing under $TOPLEVEL that git does not track."
+  fi
+  for t in "${REPO_TARGETS[@]}"; do
+    # The ~/.claude carve-out applies here too, so a shell write to the memory
+    # store behaves the same as a Write to it.
+    case "$t/" in "$CLAUDE_HOME"/*) continue ;; esac
+    if [ -e "$t" ] && ! git -C "$CONTEXT_DIR" ls-files --error-unmatch -- "$t" >/dev/null 2>&1; then
+      emit deny "Blocked: this command writes to '$t', which exists under $TOPLEVEL but is not tracked by git, so the change cannot be reviewed or undone -- there is no committed version to fall back on. This applies on every branch. Ask the user whether to track it first, or leave it alone."
+    fi
+  done
+fi
+
 if printf '%s\n' "$ALLOWED" | grep -qxF "$CURRENT_BRANCH"; then
   allow
 fi
@@ -393,54 +471,14 @@ case "$TOOL_NAME" in
       emit deny "Blocked: state-changing git command on branch '$CURRENT_BRANCH', which is not an allowed branch ($ALLOWED_LIST)."
     fi
 
-    CONTENT_RE='(^|[;&|[:space:]])(rm|mv|cp|dd|truncate|tee|install|shred)[[:space:]]|sed[[:space:]]+[^|]*-i|[^0-9>]>>?[[:space:]]*[^&[:space:]]'
-
-    # Does any argument resolve to a path inside the repo? Command names and
-    # flag values are skipped; a token counts only if it looks like a path or
-    # actually exists, so 'install -m 755 ...' is not fooled by the mode.
-    targets_repo() {
-      local seg tok first resolved
-      # 'cd' can move the base of every relative path -- treat as unresolvable.
-      echo "$COMMAND" | grep -qE '(^|[;&|[:space:]])cd[[:space:]]' && return 2
-      # Substitutions and globs hide their targets from static inspection.
-      echo "$COMMAND" | grep -qE '\$\(|`|\$[A-Za-z_{]|\*|\?' && return 2
-      local is_sed
-      while IFS= read -r seg; do
-        first=1
-        is_sed=0
-        echo "$seg" | grep -qE '(^|[[:space:]])sed([[:space:]]|$)' && is_sed=1
-        for tok in $(echo "$seg" | tr '<>' '  '); do
-          tok=${tok#[\"\']}; tok=${tok%[\"\']}
-          # a sed script ('s/a/b/', '1,$d') is not a path despite the slashes
-          if [ $is_sed = 1 ]; then
-            case "$tok" in [0-9,\$]*s[/,\|:#]*|s[/,\|:#]*) continue ;; esac
-          fi
-          # skip the command word and common wrappers
-          if [ $first = 1 ]; then
-            case "$tok" in sudo|env|command|xargs|time|nohup) continue ;; esac
-            first=0; continue
-          fi
-          case "$tok" in -*) continue ;; esac
-          # ignore bare words that are neither path-like nor existing files
-          case "$tok" in
-            */*|*.*) ;;
-            *) [ -e "$tok" ] || continue ;;
-          esac
-          resolved=$(realpath -m -- "$tok" 2>/dev/null) || continue
-          case "$resolved/" in "$TOPLEVEL"/*) return 0 ;; esac
-        done
-      done <<EOF
-$(echo "$COMMAND" | tr ';|&' '\n')
-EOF
-      return 1
-    }
-
-    if echo "$COMMAND" | grep -qE "$CONTENT_RE"; then
-      targets_repo; hit=$?
-      case $hit in
-        0) emit deny "Blocked: this command changes file content under $TOPLEVEL, and branch '$CURRENT_BRANCH' is not an allowed branch ($ALLOWED_LIST)." ;;
-        2) emit ask "Branch '$CURRENT_BRANCH' is not an allowed branch ($ALLOWED_LIST). This command modifies files and its targets could not be resolved statically. Approve only if it touches nothing in $TOPLEVEL." ;;
-      esac
+    # Only reached on a disallowed branch, where ANY write under the repo is
+    # refused -- creating a new file included. CONTENT_RE, collect_repo_targets
+    # and REPO_TARGETS were all evaluated above; the untracked and unresolvable
+    # cases have already emitted, so what is left here is a write to a tracked
+    # file or to a path that does not exist yet. Both are fine on an allowed
+    # branch and neither is fine here.
+    if [ "$content_hit" = 0 ]; then
+      emit deny "Blocked: this command changes file content under $TOPLEVEL, and branch '$CURRENT_BRANCH' is not an allowed branch ($ALLOWED_LIST)."
     fi
 
     # The metadata check that used to sit here now runs before the branch logic

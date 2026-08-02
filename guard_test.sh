@@ -159,6 +159,39 @@ runw "$CH" "$CH/CLAUDE.md" deny
 echo "== rule 6: outside any repo =="
 runw "$TMP" "$TMP/loose.txt" ALLOW
 
+echo "== rule 2a via SHELL: same answers as the file tools, on an allowed branch =="
+run "$A" 'echo hi > untracked.txt' deny
+run "$A" 'echo hi > ignored-dir/untracked-but-ignored.md' deny
+run "$A" 'echo hi > brand-new.txt' ALLOW
+run "$A" 'echo hi > tracked.txt' ALLOW
+run "$A" 'sed -i s/a/b/ tracked.txt' ALLOW
+run "$A" 'cp /etc/hostname tracked.txt' ALLOW
+run "$A" 'cp /etc/hostname untracked.txt' deny
+run "$A" 'rm untracked.txt' deny
+
+echo "== the file tools agree with the shell on the same paths =="
+runw "$A" "$A/untracked.txt" deny
+runw "$A" "$A/brand-new.txt" ALLOW
+runw "$A" "$A/tracked.txt" ALLOW
+
+echo "== on a disallowed branch every write is still refused =="
+run "$D" 'echo hi > brand-new.txt' deny
+run "$D" 'echo hi > tracked.txt' deny
+run "$D" 'echo hi > untracked.txt' deny
+
+echo "== unresolvable targets ask, on either branch =="
+run "$A" 'rm -rf "$SOMEVAR/dir"' ask
+run "$D" 'rm -rf "$SOMEVAR/dir"' ask
+run "$A" 'cat x.txt > out-$(date +%s).txt' ask
+
+echo "== reads never trip the content rule =="
+run "$A" 'ls -la' ALLOW
+run "$A" 'grep -rn pattern src/' ALLOW
+run "$A" 'cargo build --release' ALLOW
+run "$A" 'objdump -T bin 2>/dev/null | head -5' ALLOW
+run "$A" 'echo hi > /dev/null' ALLOW
+run "$A" 'wc -l < tracked.txt' ALLOW
+
 echo "== rule 3: metadata prompts rather than refusing =="
 run "$D" 'chmod +x tracked.txt' ask
 run "$A" 'chmod +x tracked.txt' ask
