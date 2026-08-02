@@ -36,6 +36,18 @@ for pair in "$D:main" "$A:aicode"; do
   echo loose > "$dir/ignored-dir/untracked-but-ignored.md"
 done
 
+# A stand-in for ~/.claude, so the location carve-out can be exercised without
+# touching the real one. The guard reads CLAUDE_CONFIG_DIR when it is set.
+export CLAUDE_CONFIG_DIR="$TMP/claudehome"
+CH="$CLAUDE_CONFIG_DIR"
+git init -q -b main "$CH"          # deliberately a DISALLOWED branch
+printf '*\n!*/\n!**/\n!.gitignore\n!CLAUDE.md\n' > "$CH/.gitignore"
+echo doc > "$CH/CLAUDE.md"
+git -C "$CH" add -A
+git -C "$CH" -c user.name=t -c user.email=t@t commit -qm init
+mkdir -p "$CH/projects/someproj/memory"
+echo mem > "$CH/projects/someproj/memory/MEMORY.md"
+
 pass=0; fail=0
 
 decide() { # decide <json> -> prints allow|deny|ask|ALLOW
@@ -134,13 +146,16 @@ runw "$A" "$A/brand-new.rs" ALLOW
 runw "$A" "$A/nested/deep/brand-new.rs" ALLOW
 echo "== rule 2a: tracked files stay editable on an allowed branch =="
 runw "$A" "$A/tracked.txt" ALLOW
-echo "== rule 2a: an ignored file is exempt even though it is untracked =="
-runw "$A" "$A/ignored-dir/untracked-but-ignored.md" ALLOW
-runw "$D" "$D/ignored-dir/untracked-but-ignored.md" ALLOW
+echo "== rule 2a: being ignored is NOT a licence to overwrite =="
+runw "$A" "$A/ignored-dir/untracked-but-ignored.md" deny
+runw "$D" "$D/ignored-dir/untracked-but-ignored.md" deny
 
-echo "== rule 4 carve-out: paths the repo ignores =="
-runw "$D" "$D/ignored-dir/memory.md" ALLOW
-runw "$D" "$D/debug.log" ALLOW
+echo "== rule 4 carve-out: untracked paths under ~/.claude, on a disallowed branch =="
+runw "$CH" "$CH/projects/someproj/memory/MEMORY.md" ALLOW
+runw "$CH" "$CH/projects/someproj/memory/brand-new.md" ALLOW
+runw "$CH" "$CH/settings.local.json" ALLOW
+echo "== but TRACKED files under ~/.claude follow the ordinary branch rule =="
+runw "$CH" "$CH/CLAUDE.md" deny
 echo "== rule 6: outside any repo =="
 runw "$TMP" "$TMP/loose.txt" ALLOW
 

@@ -26,14 +26,16 @@
 #   2a. Also branch-independent: an EXISTING file in the repo that git does not
 #      track may not be overwritten, on allowed branches as much as disallowed
 #      ones. Git holds no copy, so the overwrite cannot be reviewed or undone.
-#      Creating a file is not covered -- a path that does not exist yet destroys
-#      nothing, and every new file is untracked until it is added. Ignored files
-#      are exempt via rule 4's carve-out, which is checked first.
+#      This includes files excluded by .gitignore -- being ignored is not a
+#      licence to overwrite, since a project's ignored set routinely holds real
+#      data and secrets. Creating a file is not covered: a path that does not
+#      exist yet destroys nothing, and every new file is untracked until added.
 #
 #   4. The test is whether the WORKING TREE is affected, not whether git would
-#      notice. A scratch or throwaway file is not exempt. The one carve-out is
-#      a path the repo itself ignores -- see the check-ignore test below, which
-#      documents why that is not a hole in the rule.
+#      notice. A scratch or throwaway file is not exempt, and neither is an
+#      ignored one. The single carve-out is keyed on LOCATION: an untracked path
+#      under ~/.claude, Claude's own config and memory store, may be written on
+#      any branch. Tracked files there are not exempt.
 #
 #   5. Read-only inspection is never blocked. A guard that refuses
 #      'git branch --show-current' would break the very check the caller is
@@ -320,25 +322,30 @@ fi
 TOPLEVEL=$(git -C "$CONTEXT_DIR" rev-parse --show-toplevel 2>/dev/null) || allow
 CURRENT_BRANCH=$(git -C "$CONTEXT_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null)
 
-# The one carve-out from rule 4. A path the repo itself ignores holds no tracked
-# content, so writing there cannot produce a commitable change on any branch,
-# cannot be lost by a checkout, and cannot end up in a diff under review. The
-# branch is therefore irrelevant to it.
+# The one carve-out, and it is keyed on LOCATION, not on ignore status: an
+# untracked path under ~/.claude may be written on any branch.
 #
-# This is narrower than "git would not notice". It does not cover a tracked file
-# with unstaged edits, or an untracked file that is not ignored -- both of those
-# still land in the working tree the rule protects, and both are still refused.
-# What it does cover is state that merely lives inside a checkout without
-# belonging to it: Claude's memory store under ~/.claude/projects sits in the
-# ~/.claude repo, whose .gitignore excludes everything bar an explicit list, so
-# without this every memory write is judged against that repo's branch.
+# That directory is Claude's own config and memory store. It happens to be a git
+# checkout, so without this every memory write is judged against whatever branch
+# that checkout sits on -- which has nothing to do with the memory being written.
+# Tracked files there (CLAUDE.md, settings.json, this script) are NOT exempt:
+# they fall through to the ordinary branch rule, so editing them still requires
+# an allowed branch.
 #
-# The exemption is deliberately keyed on the enclosing repo's own .gitignore,
-# not on a path list here, so each repo decides for itself what it disowns.
-# Applies to the file-taking tools only; a shell command that writes to an
-# ignored path is still handled by the content rules below.
-if [ -n "$FILE_PATH" ] && git -C "$CONTEXT_DIR" check-ignore -q -- "$FILE_PATH" 2>/dev/null; then
-  allow
+# An earlier version keyed this on 'git check-ignore' instead, exempting any
+# ignored path in any repo. That was far too wide: a project's ignored set
+# routinely holds real data and secrets -- spreadsheets under data/, API keys in
+# .devcontainer/devcontainer.env -- and exempting those meant they could be
+# overwritten silently, with no diff and nothing to recover from. Ignored files
+# outside ~/.claude are now covered by rule 2a like any other untracked file.
+if [ -n "$FILE_PATH" ]; then
+  CLAUDE_HOME=$(realpath -m -- "${CLAUDE_CONFIG_DIR:-$HOME/.claude}" 2>/dev/null)
+  FILE_ABS=$(realpath -m -- "$FILE_PATH" 2>/dev/null)
+  case "$FILE_ABS/" in
+    "$CLAUDE_HOME"/*)
+      git -C "$CONTEXT_DIR" ls-files --error-unmatch -- "$FILE_PATH" >/dev/null 2>&1 || allow
+      ;;
+  esac
 fi
 
 # Rule 2a: an EXISTING file inside the repo that git does not track may not be
@@ -351,11 +358,14 @@ fi
 # nothing, and every new file is untracked until it is added, so refusing those
 # would mean never being able to add a source file, test or document.
 #
-# Order matters twice over. This runs after the ignore carve-out above, because
-# ignored files are untracked too and would otherwise be caught here -- that
-# would re-break the memory store the carve-out exists to permit. And it runs
-# before the allowed-branch check below, because being on an allowed branch does
-# not give git a copy of the file.
+# Ignored files are untracked, so they are covered here too: being listed in
+# .gitignore is not a licence to overwrite. That is the point of keying the
+# carve-out above on location instead -- data/*.xlsx and devcontainer.env are
+# ignored, and must still be protected.
+#
+# Order matters twice over. This runs after the ~/.claude carve-out above, so
+# the memory store stays writable. And it runs before the allowed-branch check
+# below, because being on an allowed branch does not give git a copy of the file.
 if [ -n "$FILE_PATH" ] && [ -e "$FILE_PATH" ] &&
    ! git -C "$CONTEXT_DIR" ls-files --error-unmatch -- "$FILE_PATH" >/dev/null 2>&1; then
   emit deny "Blocked: '$FILE_PATH' exists under $TOPLEVEL but is not tracked by git, so overwriting it cannot be reviewed or undone -- there is no committed version to fall back on. This applies on every branch. Ask the user whether to track it first, or leave it alone."
