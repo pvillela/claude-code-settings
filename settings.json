@@ -21,7 +21,6 @@
       "Read(//tmp/**)"
     ],
     "deny": [
-      "Bash(git commit *)",
       "Bash(git push *)",
       "Read(.env)"
     ]
