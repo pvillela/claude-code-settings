@@ -10,6 +10,7 @@
 !skills/**
 !CLAUDE.md
 !global-git-guard.sh
+!guard_test.sh
 !LICENSE
 !README.md
 !settings.json

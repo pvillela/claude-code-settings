@@ -14,13 +14,14 @@
 #        - a git command that changes repository state;
 #        - a shell command that rewrites file content under the repo root.
 #
-#   3. On a branch that is not allowed, these prompt the user (ask):
-#        - a content-rewriting shell command whose targets cannot be resolved
-#          statically, because a 'cd', a variable, a glob or a substitution
-#          hides where it would write;
-#        - chmod, chown, chgrp, ln and touch anywhere, on any branch, because
-#          git records the executable bit but not ownership, so the damage can
-#          be invisible in 'git status'.
+#   3. These prompt the user (ask) rather than being refused:
+#        - on a branch that is not allowed, a content-rewriting shell command
+#          whose targets cannot be resolved statically, because a 'cd', a
+#          variable, a glob or a substitution hides where it would write;
+#        - chmod, chown, chgrp, ln and touch, ON ANY BRANCH and any file,
+#          allowed branches and non-repo paths included, because git records the
+#          executable bit but not ownership, so the damage can be invisible in
+#          'git status'. Like rule 5a this runs ahead of the branch logic.
 #
 #   4. The test is whether the WORKING TREE is affected, not whether git would
 #      notice. A scratch or throwaway file is not exempt. The one carve-out is
@@ -285,6 +286,21 @@ if [ "$TOOL_NAME" = "Bash" ] && git_command_writes_config "$COMMAND"; then
   emit deny "Blocked: this writes git config, which is refused on every branch, including allowed ones, because it silently changes behaviour for future work and is invisible to git status. Reading config is fine, and 'git -c name=value <command>' applies a setting for one invocation without persisting it. If the setting really should persist, ask the user to make the change."
 fi
 
+# Rule 3, metadata. Like the config rule above, this sits ahead of the branch
+# logic because it applies on any branch and to any file, allowed branches and
+# non-repo paths included. It used to live after the allowed-branch check, which
+# made it unreachable exactly where it was most needed: a chmod on an allowed
+# branch went through silently.
+#
+# Git records the executable bit but not ownership, so a chown can make a file
+# unreadable without ever showing up in 'git status'. The decision is 'ask' and
+# not 'deny' because these commands are often legitimate -- the point is that
+# they are seen, not that they are refused.
+if [ "$TOOL_NAME" = "Bash" ] &&
+   echo "$COMMAND" | grep -qE '(^|[;&|[:space:]])(chmod|chown|chgrp|ln|touch)[[:space:]]'; then
+  emit ask "This command changes file metadata (permissions, ownership, links or timestamps), which git may not record -- a chown leaves no trace in git status. This is asked on every branch, allowed ones included. Approve only if you intend it."
+fi
+
 # Resolve the repo relative to the file being touched, not just the CWD, so a
 # Write to another checkout is judged against that checkout's branch.
 CONTEXT_DIR="$PWD"
@@ -341,7 +357,6 @@ case "$TOOL_NAME" in
     fi
 
     CONTENT_RE='(^|[;&|[:space:]])(rm|mv|cp|dd|truncate|tee|install|shred)[[:space:]]|sed[[:space:]]+[^|]*-i|[^0-9>]>>?[[:space:]]*[^&[:space:]]'
-    META_RE='(^|[;&|[:space:]])(chmod|chown|chgrp|ln|touch)[[:space:]]'
 
     # Does any argument resolve to a path inside the repo? Command names and
     # flag values are skipped; a token counts only if it looks like a path or
@@ -391,9 +406,8 @@ EOF
       esac
     fi
 
-    if echo "$COMMAND" | grep -qE "$META_RE"; then
-      emit ask "Branch '$CURRENT_BRANCH' is not an allowed branch ($ALLOWED_LIST). This command changes file metadata (permissions, ownership, links or timestamps), which git may not show. Approve only if you intend it."
-    fi
+    # The metadata check that used to sit here now runs before the branch logic
+    # above, so that it applies on allowed branches too. Nothing replaces it.
     ;;
 esac
 
