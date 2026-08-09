@@ -163,11 +163,24 @@ echo "== rule 2a via SHELL: same answers as the file tools, on an allowed branch
 run "$A" 'echo hi > untracked.txt' deny
 run "$A" 'echo hi > ignored-dir/untracked-but-ignored.md' deny
 run "$A" 'echo hi > brand-new.txt' ALLOW
-run "$A" 'echo hi > tracked.txt' ALLOW
-run "$A" 'sed -i s/a/b/ tracked.txt' ALLOW
-run "$A" 'cp /etc/hostname tracked.txt' ALLOW
 run "$A" 'cp /etc/hostname untracked.txt' deny
 run "$A" 'rm untracked.txt' deny
+
+# Rule 3, in-place rewrite of a TRACKED file through the shell. Recoverable, so
+# the branch rule stays out of it, but it bypasses the PostToolUse formatter --
+# asked, not refused. These three asserted ALLOW before the rule existed.
+echo "== rule 3: shell rewrites of a TRACKED file ask, on an allowed branch =="
+run "$A" 'echo hi > tracked.txt' ask
+run "$A" 'sed -i s/a/b/ tracked.txt' ask
+run "$A" 'cp /etc/hostname tracked.txt' ask
+# A tracked file under ~/.claude is not exempt from the shell path either: the
+# carve-out is keyed on untracked, so this falls through to the branch rule and
+# is denied, agreeing with the 'Write claudehome/CLAUDE.md' case above. $CH sits
+# on main deliberately, so the deny -- not the ask -- is what proves the
+# carve-out no longer swallows tracked files.
+run "$CH" 'sed -i s/a/b/ CLAUDE.md' deny
+# The deny for an untracked target outranks the ask when a command hits both.
+run "$A" 'sed -i s/a/b/ tracked.txt untracked.txt' deny
 
 echo "== the file tools agree with the shell on the same paths =="
 runw "$A" "$A/untracked.txt" deny
@@ -178,11 +191,29 @@ echo "== on a disallowed branch every write is still refused =="
 run "$D" 'echo hi > brand-new.txt' deny
 run "$D" 'echo hi > tracked.txt' deny
 run "$D" 'echo hi > untracked.txt' deny
+# The in-place rule must never soften this into a prompt: on a disallowed branch
+# these are the same three commands that ask on an allowed one, and they are
+# refused outright here.
+run "$D" 'sed -i s/a/b/ tracked.txt' deny
+run "$D" 'cp /etc/hostname tracked.txt' deny
 
-echo "== unresolvable targets ask, on either branch =="
+echo "== unresolvable targets ask on an allowed branch =="
 run "$A" 'rm -rf "$SOMEVAR/dir"' ask
-run "$D" 'rm -rf "$SOMEVAR/dir"' ask
 run "$A" 'cat x.txt > out-$(date +%s).txt' ask
+run "$A" 'rm -rf /tmp/scratch/*' ask
+
+# On a disallowed branch an unresolved target is refused, not prompted for:
+# approving the prompt would put the write on the protected branch. The escape
+# is proof that the targets lie outside the repo, not a plausible-looking path.
+echo "== unresolvable targets on a disallowed branch: deny unless provably outside =="
+run "$D" 'rm -rf "$SOMEVAR/dir"' deny          # a variable may hold ../..
+run "$D" 'cat x.txt > out-$(date +%s).txt' deny # so may a substitution
+run "$D" 'rm -rf *.log' deny                    # relative glob: bounded by PWD, in the repo
+run "$D" 'rm -rf build/*' deny                  # ditto, one level down
+run "$D" 'rm -rf /tmp/scratch/*' ask            # glob cannot escape /tmp
+run "$D" 'sed -i s/a/b/ /etc/hosts.d/*.conf' ask
+run "$D" 'cd /tmp && rm -rf build/*' ask        # literal cd rebases it outside
+run "$D" 'cd /tmp && rm -rf $X/build' deny      # variable defeats the proof anyway
 
 echo "== reads never trip the content rule =="
 run "$A" 'ls -la' ALLOW
@@ -191,6 +222,16 @@ run "$A" 'cargo build --release' ALLOW
 run "$A" 'objdump -T bin 2>/dev/null | head -5' ALLOW
 run "$A" 'echo hi > /dev/null' ALLOW
 run "$A" 'wc -l < tracked.txt' ALLOW
+# An arrow in a quoted string is not a redirection. On a disallowed branch this
+# was a deny before the '-' exclusion: the arrow tripped the content rule and the
+# substitutions made the targets unresolvable, so a read-only command was
+# refused. Both branches, because the regex runs ahead of the branch logic.
+run "$A" 'echo "CLAUDE.md: $(wc -c < a) -> $(wc -c < b) chars"' ALLOW
+run "$D" 'echo "CLAUDE.md: $(wc -c < a) -> $(wc -c < b) chars"' ALLOW
+run "$D" 'echo "size 3 -> 4"' ALLOW
+# A real redirection is still caught: only the character before '>' changed.
+run "$D" 'echo hi > tracked.txt' deny
+run "$A" 'echo hi >> untracked.txt' deny
 
 echo "== rule 3: metadata prompts rather than refusing =="
 run "$D" 'chmod +x tracked.txt' ask

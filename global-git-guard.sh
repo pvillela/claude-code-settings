@@ -12,16 +12,31 @@
 #   2. On a branch that is not allowed, these are refused outright (deny):
 #        - Write, Edit, MultiEdit, NotebookEdit to any path in the repo;
 #        - a git command that changes repository state;
-#        - a shell command that rewrites file content under the repo root.
+#        - a shell command that rewrites file content under the repo root;
+#        - a shell command whose write targets cannot be resolved statically and
+#          cannot be proven to lie outside the repo. See rule 3.
 #
 #   3. These prompt the user (ask) rather than being refused:
-#        - on a branch that is not allowed, a content-rewriting shell command
-#          whose targets cannot be resolved statically, because a 'cd', a
-#          variable, a glob or a substitution hides where it would write;
+#        - a content-rewriting shell command whose targets cannot be resolved
+#          statically, because a 'cd', a variable, a glob or a substitution
+#          hides where it would write. This asks only on an ALLOWED branch. On
+#          one that is not allowed it is DENIED, unless the targets can be
+#          PROVEN to lie outside the repo -- an unresolved target must not turn
+#          into a prompt that puts a write on a protected branch, and "I could
+#          not parse this" is not the same as "I can say nothing about it".
+#          What is and is not provable is set out at provably_outside_repo.
 #        - chmod, chown, chgrp, ln and touch, ON ANY BRANCH and any file,
 #          allowed branches and non-repo paths included, because git records the
 #          executable bit but not ownership, so the damage can be invisible in
 #          'git status'. Like rule 5a this runs ahead of the branch logic.
+#        - on an ALLOWED branch, a shell command that rewrites an existing
+#          TRACKED file in place -- 'sed -i', a redirection onto it, tee, cp
+#          over it. The write is recoverable, so rule 2 has nothing to say about
+#          it, but it bypasses the PostToolUse formatter, which keys on the
+#          file_path of an Edit/Write call and cannot see a file rewritten by a
+#          shell command. Asked and not refused, because a bulk mechanical
+#          rewrite across many files is a legitimate use of sed. On a branch
+#          that is not allowed the rule 2 deny still fires and takes precedence.
 #
 #   2a. Also branch-independent: an EXISTING file in the repo that git does not
 #      track may not be overwritten, on allowed branches as much as disallowed
@@ -377,11 +392,23 @@ if [ -r "$ALLOWED_FILE" ]; then
 else
   ALLOWED="aicode"
 fi
+# Computed here rather than after the branch check below, because the
+# unresolvable-target deny names it too and runs earlier.
+ALLOWED_LIST=$(printf '%s' "$ALLOWED" | paste -sd, -)
 
 # Shell commands that rewrite file content: the writing utilities, an in-place
-# sed, and any output redirection. The leading [^0-9>] excludes '2>&1', so an
-# ordinary '2>/dev/null' does not match.
-CONTENT_RE='(^|[;&|[:space:]])(rm|mv|cp|dd|truncate|tee|install|shred)[[:space:]]|sed[[:space:]]+[^|]*-i|[^0-9>]>>?[[:space:]]*[^&[:space:]]'
+# sed, and any output redirection. The leading class excludes a digit, so
+# '2>/dev/null' does not match; a '>', so '>>' is handled by the quantifier
+# rather than matched twice; and a '-', so an arrow inside a quoted string --
+# 'echo "a -> b"' -- is not mistaken for a redirection.
+#
+# That last exclusion is a targeted fix, not a general one. A '>' inside quotes
+# is still a redirection to this regex in every other form ('=>', '<>'), because
+# telling the two apart needs shell-aware parsing rather than a pattern. It
+# earns its place because the arrow is the case that actually turns up, and
+# because a false positive here is now a deny rather than a prompt on a branch
+# that is not allowed.
+CONTENT_RE='(^|[;&|[:space:]])(rm|mv|cp|dd|truncate|tee|install|shred)[[:space:]]|sed[[:space:]]+[^|]*-i|[^0-9>-]>>?[[:space:]]*[^&[:space:]]'
 
 # Collects the arguments that resolve to paths inside the repo into REPO_TARGETS.
 # Command names and flag values are skipped, and a token counts only if it looks
@@ -389,6 +416,7 @@ CONTENT_RE='(^|[;&|[:space:]])(rm|mv|cp|dd|truncate|tee|install|shred)[[:space:]
 # mode. Returns 0 when at least one target was found, 1 when none were, and 2
 # when the command hides its targets from static inspection.
 REPO_TARGETS=()
+INPLACE_TRACKED=""
 collect_repo_targets() {
   local seg tok first resolved is_sed found=0
   # 'cd' can move the base of every relative path -- treat as unresolvable.
@@ -426,6 +454,73 @@ EOF
   return 1
 }
 
+# True when every write target of an otherwise unresolvable command is PROVABLY
+# outside $TOPLEVEL. Used only on a branch that is not allowed, where "I could
+# not parse this" must not become "approve it and write to a protected branch".
+# Giving up on resolving a target is not the same as being unable to say
+# anything about it, and the difference is what decides deny versus ask.
+#
+# What can be proved, and what cannot:
+#
+#   $VAR, $(...), `...`   Nothing can be proved. A variable may hold '../..', so
+#                         even '/tmp/$X' can name a file inside the repo. Any
+#                         token carrying one is unprovable, and so is the whole
+#                         command -- there is no safe partial credit here.
+#   * and ?               Bounded. A glob never matches '/', so the literal text
+#                         before the first glob character contains every
+#                         expansion: '/tmp/*.log' cannot escape /tmp.
+#   cd <literal>          Rebases the relative targets. One literal cd is worth
+#                         following; a second, or one hiding a glob, is not.
+#
+# 'set -f' matters: without it the token loop would expand the very globs it is
+# trying to reason about, against whatever PWD happens to be.
+#
+# Known limit, accepted deliberately: a glob may match a symlink pointing back
+# into the repo, and an in-place rewrite would follow it. Refusing every command
+# containing an asterisk costs more than that case is worth.
+provably_outside_repo() {
+  local - ; set -f
+  local seg tok base first is_sed lit resolved
+  echo "$COMMAND" | grep -qE '\$\(|`|\$[A-Za-z_{]' && return 1
+
+  base="$PWD"
+  if echo "$COMMAND" | grep -qE '(^|[;&|[:space:]])cd[[:space:]]'; then
+    [ "$(echo "$COMMAND" | grep -cE '(^|[;&|[:space:]])cd[[:space:]]')" -eq 1 ] || return 1
+    base=$(echo "${COMMAND//[;&|]/ }" | awk '{for(i=1;i<=NF;i++) if($i=="cd"){print $(i+1); exit}}')
+    base=${base#[\"\']}; base=${base%[\"\']}
+    [ -n "$base" ] || return 1
+    case "$base" in *[\*\?]*) return 1 ;; esac
+    case "$base" in /*) ;; *) base="$PWD/$base" ;; esac
+  fi
+
+  while IFS= read -r seg; do
+    first=1
+    is_sed=0
+    echo "$seg" | grep -qE '(^|[[:space:]])sed([[:space:]]|$)' && is_sed=1
+    for tok in $(echo "$seg" | tr '<>' '  '); do
+      tok=${tok#[\"\']}; tok=${tok%[\"\']}
+      if [ $is_sed = 1 ]; then
+        case "$tok" in [0-9,\$]*s[/,\|:#]*|s[/,\|:#]*) continue ;; esac
+      fi
+      if [ $first = 1 ]; then
+        case "$tok" in sudo|env|command|xargs|time|nohup|cd) continue ;; esac
+        first=0; continue
+      fi
+      case "$tok" in -*) continue ;; esac
+      case "$tok" in */*|*.*|*[\*\?]*) ;; *) [ -e "$tok" ] || continue ;; esac
+      # Bound the token by the literal directory before its first glob character.
+      lit=${tok%%[\*\?]*}
+      case "$lit" in */*) lit=${lit%/*} ;; *) lit="." ;; esac
+      case "$lit" in /*) ;; *) lit="$base/$lit" ;; esac
+      resolved=$(realpath -m -- "$lit" 2>/dev/null) || return 1
+      case "$resolved/" in "$TOPLEVEL"/*) return 1 ;; esac
+    done
+  done <<EOF
+$(echo "$COMMAND" | tr ';|&' '\n')
+EOF
+  return 0
+}
+
 # Rule 2a for shell commands. The file tools are checked by path further up;
 # this applies the same rule to 'echo > f', 'cp', 'sed -i' and friends, and like
 # rule 2a it runs on EVERY branch. The classification is deliberately identical
@@ -444,23 +539,48 @@ EOF
 if [ "$TOOL_NAME" = "Bash" ] && echo "$COMMAND" | grep -qE "$CONTENT_RE"; then
   collect_repo_targets; content_hit=$?
   if [ "$content_hit" = 2 ]; then
+    # On a branch that is not allowed, no write under the repo root is
+    # permitted, and an unresolved target is not a licence to prompt for one --
+    # approving the prompt would put the write on the protected branch. So the
+    # answer here is deny unless the targets can be PROVEN to lie outside the
+    # repo, which is the one case where the branch has no bearing at all.
+    if ! printf '%s\n' "$ALLOWED" | grep -qxF "$CURRENT_BRANCH" && ! provably_outside_repo; then
+      emit deny "Blocked: this command modifies files, its targets could not be resolved statically -- a variable, substitution, glob or 'cd' hides where it would write -- and branch '$CURRENT_BRANCH' is not an allowed branch ($ALLOWED_LIST). It cannot be shown to write only outside $TOPLEVEL, and on this branch that is what it would have to show. Rewrite it with literal paths, or ask the user to switch branches."
+    fi
     emit ask "This command modifies files and its targets could not be resolved statically -- a variable, glob, substitution or 'cd' hides where it would write. Approve only if it touches nothing under $TOPLEVEL that git does not track."
   fi
   for t in "${REPO_TARGETS[@]}"; do
+    tracked=0
+    git -C "$CONTEXT_DIR" ls-files --error-unmatch -- "$t" >/dev/null 2>&1 && tracked=1
     # The ~/.claude carve-out applies here too, so a shell write to the memory
-    # store behaves the same as a Write to it.
-    case "$t/" in "$CLAUDE_HOME"/*) continue ;; esac
-    if [ -e "$t" ] && ! git -C "$CONTEXT_DIR" ls-files --error-unmatch -- "$t" >/dev/null 2>&1; then
+    # store behaves the same as a Write to it. It is keyed on UNTRACKED, exactly
+    # as the file-tool carve-out further up is: a tracked file there (CLAUDE.md,
+    # settings.json, this script) is not exempt and falls through to the checks
+    # below like any other tracked file. Before the in-place rule was added this
+    # distinction made no difference, since a tracked file never trips the
+    # untracked deny -- a blanket 'continue' was equivalent, and is not now.
+    case "$t/" in "$CLAUDE_HOME"/*) [ "$tracked" = 0 ] && continue ;; esac
+    if [ -e "$t" ] && [ "$tracked" = 0 ]; then
       emit deny "Blocked: this command writes to '$t', which exists under $TOPLEVEL but is not tracked by git, so the change cannot be reviewed or undone -- there is no committed version to fall back on. This applies on every branch. Ask the user whether to track it first, or leave it alone."
     fi
+    # Rule 3, in-place rewrite of a tracked file. Recorded rather than emitted
+    # here, for two reasons: an untracked target later in the list must still
+    # produce the stronger deny above, and on a disallowed branch the rule 2 deny
+    # further down must win. The ask is emitted at the allowed-branch exit.
+    [ "$tracked" = 1 ] && INPLACE_TRACKED="$t"
   done
 fi
 
 if printf '%s\n' "$ALLOWED" | grep -qxF "$CURRENT_BRANCH"; then
+  # Rule 3, in-place rewrite of a tracked file. This sits INSIDE the allowed
+  # branch arm on purpose. On a disallowed branch the same command is refused
+  # outright by rule 2 below, and asking first would downgrade that deny to a
+  # prompt the user could wave through.
+  if [ -n "$INPLACE_TRACKED" ]; then
+    emit ask "This rewrites the tracked file '$INPLACE_TRACKED' through the shell rather than through Edit/Write. The change is recoverable, so the branch is not the problem -- but the PostToolUse formatter keys on the file_path of an Edit/Write call and cannot see a file written by a shell command, so the file may be left unformatted. Approve if this is a bulk mechanical rewrite; otherwise have Claude use Edit."
+  fi
   allow
 fi
-
-ALLOWED_LIST=$(printf '%s' "$ALLOWED" | paste -sd, -)
 
 case "$TOOL_NAME" in
   Write|Edit|MultiEdit|NotebookEdit)
