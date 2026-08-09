@@ -11,6 +11,16 @@
 - Use subagents (Explore, Plan, general-purpose) whenever you judge them useful. Do not ask first. In plan mode, follow the workflow's own guidance on Explore and Plan agents rather than any default that reserves them for explicit requests.
 - Keep exercising judgement: read directly when the search space is small or already in context, since a cold agent re-derives what is already known.
 
+## Code formatting
+- Leave every file you touch conforming to its language's standard formatter. A file I open should
+  never produce a diff the moment my editor saves it.
+- Rust: run `cargo fmt` before reporting work done, and confirm with `cargo fmt --check`. Editing an
+  `.rs` file by hand or by script does not keep rustfmt happy — line lengths, chain breaks and
+  argument wrapping all drift. A `PostToolUse` hook formats single files as you edit them, but it is
+  a backstop: it cannot see a file written by a shell command, so the explicit check still stands.
+- Do not reformat code you did not otherwise change. Running the formatter over the whole tree to
+  fix your own drift is fine; a reflow of untouched code is noise in the diff.
+
 ## Critical Git rules
 - The allowed branches are `aicode` and the branches listed in `.claude/allowed-branches` at the repo root (one per
   line). If that file is absent, the only allowed branch is `aicode`.

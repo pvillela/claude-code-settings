@@ -13,6 +13,7 @@
 !guard_test.sh
 !LICENSE
 !README.md
+!rustfmt-on-edit.sh
 !settings.json
 !statusline-command.sh
 

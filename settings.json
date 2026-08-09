@@ -37,6 +37,17 @@
           }
         ]
       }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash $HOME/.claude/rustfmt-on-edit.sh"
+          }
+        ]
+      }
     ]
   },
   "statusLine": {
