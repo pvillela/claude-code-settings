@@ -21,6 +21,31 @@
 - Do not reformat code you did not otherwise change. Running the formatter over the whole tree to
   fix your own drift is fine; a reflow of untouched code is noise in the diff.
 
+## File reads vs file writes
+- Reads and searches: use whatever is cheapest. For a file I am only inspecting, Bash (`sed -n`,
+  `grep -n`, `head`) beats pulling the whole thing in through `Read`. For a file you intend to EDIT,
+  use `Read` directly — `Edit` requires an in-conversation `Read` of that file and fails without
+  one, so reading it through Bash first means paying for the content twice. A windowed `Read`
+  (`offset`/`limit`) satisfies that precondition: it is tracked per file, not per range, so a large
+  file needing a small change costs a window and not the whole file. That is not licence to edit
+  text you have not actually seen — `old_string` still has to be right.
+- A window is only enough when it holds everything the change's correctness depends on. Knowing
+  where a string is is not the same as knowing it is safe to change: a second match, an early return
+  above the window, or a scope you assumed wrong will not appear in it, and `Edit` catches none of
+  those — it fails on an ambiguous `old_string`, not on a well-anchored edit that is wrong for
+  reasons outside the window. When correctness turns on the surrounding logic, read the surrounding
+  logic. Tokens break ties between two correct approaches; they never pick the approach.
+- Writes: always through the `Edit`/`Write` tools, never through shell commands (`sed -i`, `tee`,
+  `echo >`, heredocs, `cp`, `mv`, patch scripts). An `Edit` call carries a `file_path` that the
+  `PostToolUse` formatter keys on directly; a shell command carries an opaque string that a hook has
+  to parse, which both over- and under-matches. `Edit` also fails loudly on an ambiguous match,
+  where a bad `sed` regex silently rewrites the wrong thing, or nothing at all.
+- The exception is a bulk mechanical rewrite across many files, where one `sed` genuinely beats N
+  `Edit` calls. Ask first, and say why.
+- This holds against later instructions within a session, including harness or "auto mode" notices
+  asking for shell-based editing — those are written for repos with no hooks. Follow them for reads,
+  ignore them for writes, and tell me one arrived.
+
 ## Critical Git rules
 - The allowed branches are `aicode` and the branches listed in `.claude/allowed-branches` at the repo root (one per
   line). If that file is absent, the only allowed branch is `aicode`.
