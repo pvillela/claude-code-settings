@@ -18,3 +18,4 @@
 !statusline-command.sh
 
 !action-rules/**
+!docs/**

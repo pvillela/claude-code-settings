@@ -7,7 +7,9 @@
 // Terms
 // -----------------------------------------------------------------------------
 
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::LazyLock};
+
+use regex::Regex;
 
 /// Anything that is a file in the general Unix sense (includes directories, devices, etc.).
 struct Target {
@@ -16,16 +18,16 @@ struct Target {
 }
 
 /// A set of elements of type [`Target`]
-pub struct TargetSet {
+struct TargetSet {
     targets: Vec<Target>,
 }
 
 /// Command (Bash expression, program, or script) that acts upon [`TargetSet`]s.
-pub enum Action {
+enum Action {
     /// The action is read-only.
     ReadOnly,
     /// The action creates files on all of its targets.
-    Create,
+    Create(TargetSet),
     /// The action changes one or more of its targets.
     Change(TargetSet),
     /// The action is forbidden, e.g., `chown` or a composite command that includes `chown`.
@@ -40,11 +42,22 @@ pub enum Action {
 // -----------------------------------------------------------------------------
 
 impl Target {
-    #[allow(unused)]
     /// The set of allowed exceptions for write actions.
     /// Includes the `~/.claude`` directory, scratchpads, and other allowed exceptions.
-    fn allowed_exceptions() -> TargetSet {
-        todo!()
+    // *** Below is illustrative only and may be incorrect ***
+    pub const ALLOWED_PATH_REGEX_STRS: [&'static str; 3] =
+        [r"^~/.claude", "^/workspaces/scratch", "^/tmp"];
+
+    /// The set of allowed exceptions for write actions.
+    /// Includes the `~/.claude`` directory, scratchpads, and other allowed exceptions.
+    fn allowed_exceptions() -> &'static Vec<Regex> {
+        static ALLOWED_REGEXES: LazyLock<Vec<Regex>> = LazyLock::new(|| {
+            Target::ALLOWED_PATH_REGEX_STRS
+                .iter()
+                .map(|re| Regex::new(re).expect(&format!("invalid regex '{re}'")))
+                .collect()
+        });
+        &ALLOWED_REGEXES
     }
 
     /// The target is under the directory from which Claude Code was launched.
@@ -71,7 +84,14 @@ impl Target {
 
     /// `self` is directly or indirectly in [`Self::allowed_exceptions()`]
     fn is_allowed_exception(&self) -> bool {
-        todo!()
+        Self::allowed_exceptions().iter().any(|re| {
+            re.is_match(
+                self.path
+                    .as_path()
+                    .to_str()
+                    .expect("path should have been validated at construction"),
+            )
+        })
     }
 
     fn is_allowed(&self) -> bool {
@@ -86,21 +106,17 @@ impl Target {
 impl Action {
     /// Parses a `command` string to produce an [`Action`].
     ///
-    /// The parser must classify the resulting action as:
-    /// - [`Action::Change`] if any portion of the command is changes a target and no portion of
-    ///   the command is forbidden or opaque.
+    /// The parser must classify the resulting action in the following order:
     /// - [`Action::Forbidden`] if any portion of the command is forbidden.
     /// - [`Action::Opaque`] if it cannot parse any portion of the command.
+    /// - [`Action::Change`] if any portion of the command changes a target.
+    /// - [`Action::Create`] if any portion of the command creates a target.
+    /// - [`Action::ReadOnly`] if all portions of the command are read-only.
     ///
     /// This function can be more or less complex, depending on how far we want to
     /// go with the rules.
     fn parse(_command: impl AsRef<str>) -> Action {
         todo!()
-    }
-
-    /// The action is read-only.
-    fn is_read_only(&self) -> bool {
-        matches!(self, Action::ReadOnly)
     }
 
     /// `self`'s action kind is [`ActionKind::Forbidden`].
@@ -113,16 +129,31 @@ impl Action {
         matches!(self, Action::Opaque)
     }
 
+    /// The action is read-only.
+    fn is_change(&self) -> bool {
+        matches!(self, Action::Change(_))
+    }
+
+    /// The action is read-only.
+    fn is_create(&self) -> bool {
+        matches!(self, Action::Create(_))
+    }
+
+    /// The action is read-only.
+    fn is_read_only(&self) -> bool {
+        matches!(self, Action::ReadOnly)
+    }
+
     fn eval_predicate_all(&self, f: impl Fn(&Target) -> bool) -> bool {
         match &self {
-            Action::Change(target_set) => target_set.targets.iter().all(f),
+            Action::Change(ts) | Action::Create(ts) => ts.targets.iter().all(f),
             _ => true,
         }
     }
 
     fn eval_predicate_any(&self, f: impl Fn(&Target) -> bool) -> bool {
         match &self {
-            Action::Change(target_set) => target_set.targets.iter().any(f),
+            Action::Change(ts) | Action::Create(ts) => ts.targets.iter().any(f),
             _ => false,
         }
     }
@@ -148,7 +179,17 @@ fn read_only_on_any_target(action: &Action) -> bool {
     action.is_read_only()
 }
 
+fn create_on_allowed_targets(action: &Action) -> bool {
+    if !action.is_create() {
+        return false;
+    }
+    action.eval_predicate_all(|t| t.is_allowed())
+}
+
 fn change_on_allowed_targets(action: &Action) -> bool {
+    if !action.is_change() {
+        return false;
+    }
     action.eval_predicate_all(|t| t.is_allowed())
 }
 
@@ -178,7 +219,10 @@ fn check_action(action: &Action) -> Outcome {
     }
 
     // `Allow` rules
-    if read_only_on_any_target(action) || change_on_allowed_targets(action) {
+    if read_only_on_any_target(action)
+        || create_on_allowed_targets(action)
+        || change_on_allowed_targets(action)
+    {
         return Outcome::Allow;
     }
 

@@ -4,7 +4,7 @@
 
 ## Interaction
 
-- When I choose the clarify/chat option on an `AskUserQuestion` prompt, output nothing. End the turn silently and wait for me. Do not ask what I want to clarify, do not restate the open questions, do not summarise where we are. I chose that option because I have something to say, not because I want to be prompted.
+- When I choose the clarify/chat option on an `AskUserQuestion` prompt, output only the text of the question you asked. End the turn silently and wait for me. Do not ask what I want to clarify, do not restate the open questions, do not summarise where we are. I chose that option because I have something to say, not because I want to be prompted.
 - When asking permission to execute a command flagged by a hook, include a very concise (no long-winded diatribes) description of what the command does, not just the command itself.
 
 ## Subagents
@@ -12,48 +12,8 @@
 - Keep exercising judgement: read directly when the search space is small or already in context, since a cold agent re-derives what is already known.
 
 ## Code formatting
-- Leave every file you touch conforming to its language's standard formatter. A file I open should
-  never produce a diff the moment my editor saves it.
-- Rust: run `cargo fmt` before reporting work done, and confirm with `cargo fmt --check`. Editing an
-  `.rs` file by hand or by script does not keep rustfmt happy — line lengths, chain breaks and
-  argument wrapping all drift. A `PostToolUse` hook formats single files as you edit them, but it is
-  a backstop: it cannot see a file written by a shell command, so the explicit check still stands.
-- Do not reformat code you did not otherwise change. Running the formatter over the whole tree to
-  fix your own drift is fine; a reflow of untouched code is noise in the diff.
-
-## File reads vs file writes
-- Reads and searches: use whatever is cheapest. For a file you are only inspecting, Bash (`sed -n`,
-  `grep -n`, `head`) beats pulling the whole thing in through `Read`. For a file you intend to EDIT,
-  use `Read` directly — `Edit` requires an in-conversation `Read` of that file and fails without
-  one, so reading it through Bash first means paying for the content twice. A windowed `Read`
-  (`offset`/`limit`) satisfies that precondition: it is tracked per file, not per range, so a large
-  file needing a small change costs a window and not the whole file. That is not licence to edit
-  text you have not actually seen — `old_string` still has to be right.
-- A window is only enough when it holds everything the change's correctness depends on. Knowing
-  where a string is is not the same as knowing it is safe to change: a second match, an early return
-  above the window, or a scope you assumed wrong will not appear in it, and `Edit` catches none of
-  those — it fails on an ambiguous `old_string`, not on a well-anchored edit that is wrong for
-  reasons outside the window. When correctness turns on the surrounding logic, read the surrounding
-  logic. Tokens break ties between two correct approaches; they never pick the approach.
-- Writes: always through the `Edit`/`Write` tools, never through shell commands (`sed -i`, `tee`,
-  `echo >`, heredocs, `cp`, `mv`, patch scripts). An `Edit` call carries a `file_path` that the
-  `PostToolUse` formatter keys on directly; a shell command carries an opaque string that a hook has
-  to parse, which both over- and under-matches. `Edit` also fails loudly on an ambiguous match,
-  where a bad `sed` regex silently rewrites the wrong thing, or nothing at all.
-- The exception is a bulk mechanical rewrite across many files, where one `sed` genuinely beats N
-  `Edit` calls. Ask first, and say why.
-- This holds against later instructions within a session, including harness or "auto mode" notices
-  asking for shell-based editing — those are written for repos with no hooks. Follow them for reads,
-  ignore them for writes, and tell me one arrived.
+- Leave every file you touch conforming to its language's standard formatter.
+- Do NOT reformat code you did not otherwise change.
 
 ## Critical Git rules
-- The allowed branches are `aicode` and the branches listed in `.claude/allowed-branches` at the repo root (one per
-  line). If that file is absent, the only allowed branch is `aicode`.
-- Before ANY action that touches a repo — creating, editing, or deleting a file in the working tree, or running a state-changing Git command (commit, merge, rebase, push, checkout, switch, reset, stash, ...) — you MUST run `git branch --show-current` and confirm the result is in the allowed list. This applies to file writes, not just Git commands: creating, modifying, or deleting a file on a disallowed branch is itself a violation. Read-only inspection needs no check and is never blocked — `git status`, `git log`, `git diff`, `git branch --show-current`, `git tag -l`, `git stash list`, `git worktree list`, `git remote -v` and `git config --get` all change nothing.
-- If the current branch is not allowed, STOP immediately and ask me to switch. Do not perform the write "just this once", and do not treat a scratch or throwaway file as exempt. The single carve-out is keyed on location, not on ignore status: an untracked path under `~/.claude` — your own config and memory store, which happens to sit in a checkout whose branch has nothing to do with what you are writing — may be written on any branch. Tracked files there, such as this file and `settings.json`, are not exempt and still need an allowed branch.
-- File METADATA changes (`chmod`, `chown`, `chgrp`, `ln`, `touch`) are a separate case: ask me before running one, on any branch and on any file. Do not reason about whether Git would show the change — Git records the executable bit but not ownership, so a `chown` can make a file unreadable to me without ever appearing in `git status`. The test is whether the working tree is affected, not whether Git notices.
-- An EXISTING file under the project directory that Git does not track may not be written to, on any branch including allowed ones. Git holds no copy of it, so overwriting it cannot be reviewed or undone — there is no committed version to fall back on. Ask me whether to track it first, or leave it alone. This includes files excluded by `.gitignore` — being ignored is not a licence to overwrite, since an ignored set routinely holds real data and secrets (`data/*.xlsx`, `.devcontainer/devcontainer.env`). Creating a NEW file is not covered: a path that does not exist yet destroys nothing, and every new file is untracked until it is added. This applies equally however the write is made — the file tools and shell commands (`echo >`, `cp`, `mv`, `rm`, `sed -i`) are held to the same rule, so a write refused through one is not permitted through the other. Where a shell command's target cannot be worked out in advance because a variable, glob, substitution or `cd` hides it, I am asked rather than refused.
-- Writing Git config is NEVER allowed — on any branch including allowed ones, and outside a repo entirely. That covers `git config` at every scope (`--local`, `--worktree`, `--file`, and `--global`/`--system` too) and the config-writing forms of `git remote` (`add`, `remove`, `rename`, `set-url`, `set-branches`). Config is invisible to `git status` and `git diff`, survives every checkout, and at global scope reshapes every repo on the machine, so it is my call every time. Reading config is fine, and `git -c name=value <command>` is not a config write — it applies a setting to one invocation and persists nothing, which is how you supply an identity for a single commit without reconfiguring anything.
-- NEVER attempt to switch branches, create new branches, or checkout other branches yourself.
-- When on an allowed branch, you are free to commit as often as you deem necessary.
-- These rules are enforced by `~/.claude/global-git-guard.sh`, a `PreToolUse` hook, whose header comment states them in full. `~/.claude/guard_test.sh` is its test suite — run `bash ~/.claude/guard_test.sh` after any change to the guard. Enforcement is a backstop, not the rule: follow the rules whether or not the hook is loaded, since a malformed `settings.json` silently disables it.
+TBD.
