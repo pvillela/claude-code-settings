@@ -15,5 +15,13 @@
 - Leave every file you touch conforming to its language's standard formatter.
 - Do NOT reformat code you did not otherwise change.
 
-## Critical Git rules
-TBD.
+## Action rules
+
+Rules for actions that write files or change repository state — what is allowed,
+what is denied, and what needs confirmation — are specified in
+[docs/action-rules.md](docs/action-rules.md). Consult them before any command
+that writes, deletes, or mutates git state.
+
+Use literal paths. A path built from a variable, a command substitution, or
+backticks is opaque to the rules, and an opaque target always requires
+confirmation.

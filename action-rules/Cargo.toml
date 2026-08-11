@@ -1,7 +1,12 @@
 [package]
-name = "action-target-rules"
+name = "action-rules"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
 regex = "1.13.1"
+
+# Used only by the `gen-md` binary, which renders the doc comments in
+# `action_rules` to Markdown. Not used by the rule spec itself.
+syn = { version = "2", features = ["full", "parsing", "extra-traits"] }
+proc-macro2 = { version = "1", features = ["span-locations"] }
