@@ -22,7 +22,7 @@
   fix your own drift is fine; a reflow of untouched code is noise in the diff.
 
 ## File reads vs file writes
-- Reads and searches: use whatever is cheapest. For a file I am only inspecting, Bash (`sed -n`,
+- Reads and searches: use whatever is cheapest. For a file you are only inspecting, Bash (`sed -n`,
   `grep -n`, `head`) beats pulling the whole thing in through `Read`. For a file you intend to EDIT,
   use `Read` directly — `Edit` requires an in-conversation `Read` of that file and fails without
   one, so reading it through Bash first means paying for the content twice. A windowed `Read`
