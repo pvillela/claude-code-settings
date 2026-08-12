@@ -29,7 +29,7 @@
 //!
 //! ## Three verdicts, and where uncertainty lives
 //!
-//! [`Outcome`] has three values, but the predicates on [`Target`] are all
+//! [`Verdict`] has three values, but the predicates on [`Target`] are all
 //! `bool`. Uncertainty is deliberately *not* spread through the predicate
 //! layer; it is produced in exactly two places:
 //!
@@ -39,8 +39,8 @@
 //!   recognise but decline to decide, and it is handed to the user.
 //!
 //! Keeping the gap explicit is the point: a two-valued design would force every
-//! recognised-but-undecided case to resolve as allow (defeating the guard) or
-//! deny (obstructing ordinary work).
+//! recognised-but-undecided case to resolve as *allow* (defeating the guard) or
+//! *deny* (obstructing ordinary work).
 //!
 //! ## Lanes
 //!
@@ -64,7 +64,7 @@
 //! [`Target::is_protected`]. Each is a flat disjunction of individually named,
 //! individually documented predicates. Moving a predicate from one body to the
 //! other, or removing it from both, is how policy changes; the disjuncts that
-//! are expected to move carry a `POLICY:` comment.
+//! are may potentially move carry a `POLICY:` comment.
 
 // This module is a specification. Its predicates are documented and composed
 // but not yet called from a running hook, so the usual dead-code analysis has
@@ -89,7 +89,7 @@ use regex::Regex;
 /// The ordering is significant: `Allow < Ask < Deny`, so composing several
 /// verdicts is `max`, and the worst verdict always wins.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Outcome {
+pub enum Verdict {
     /// Proceed without involving the user.
     Allow,
     /// Hand the decision to the user.
@@ -139,7 +139,9 @@ pub struct Target {
 /// A [`Target`] together with what the action does to it.
 #[derive(Clone, Debug)]
 pub struct TargetedEffect {
+    /// The path acted upon.
     target: Target,
+    /// What the action does to it.
     effect: Effect,
 }
 
@@ -177,9 +179,7 @@ pub enum GitAction {
     /// A read-only git invocation.
     ///
     /// Determined by an **allowlist** of subcommands: anything not on the list
-    /// is treated as mutating. The inverse arrangement — a denylist of writing
-    /// subcommands — is what lets `git add`, `git fetch` and
-    /// `git submodule update` pass unexamined today.
+    /// is treated as mutating.
     Read,
     /// An ordinary state mutation: `commit`, `merge`, `rebase`, `switch`.
     ///
@@ -304,6 +304,7 @@ impl Target {
     }
 
     /// The target is a write sink — see [`Self::WRITE_SINK_REGEX_STRS`].
+    // gen-md: show-body
     fn is_write_sink(&self) -> bool {
         Self::sink_regexes()
             .iter()
@@ -315,6 +316,7 @@ impl Target {
     /// Scoped so as never to overlap [`Self::is_protected`]: a path that is
     /// itself a repository root is excluded, so that an exception root cannot
     /// authorise the destruction of the repository it contains.
+    // gen-md: show-body
     fn is_allowed_exception(&self) -> bool {
         !self.is_repo_root()
             && Self::exception_regexes()
@@ -397,8 +399,7 @@ impl Target {
     ///
     /// Protected, creation included. A second checkout is not the project the
     /// session was opened against, and the guard has no basis for judging what
-    /// is safe there. This is the case the previous `$PWD`-anchored guard failed
-    /// **open** on.
+    /// is safe there.
     fn is_in_foreign_repo(&self) -> bool {
         todo!()
     }
@@ -422,6 +423,7 @@ impl Target {
     /// See also [`Self::is_protected`]. The two are deliberately not
     /// complements; the invariant is that no target satisfies both, and a target
     /// satisfying neither is referred to the user.
+    // gen-md: show-body
     fn is_allowed(&self) -> bool {
         self.is_write_sink()
             || self.is_allowed_exception()
@@ -435,6 +437,7 @@ impl Target {
     /// **Not** the complement of [`Self::is_allowed`]. The invariant is
     /// `!(is_allowed() && is_protected())`; the gap between the two is the space
     /// of targets that require confirmation.
+    // gen-md: show-body
     fn is_protected(&self) -> bool {
         self.is_repo_root()
             || self.is_loose()
@@ -511,11 +514,13 @@ impl Action {
 // ----- Short-circuit -----
 
 /// The command contains a forbidden operation.
+// gen-md: show-body
 fn forbidden_action(action: &Action) -> bool {
     action.is_forbidden()
 }
 
 /// The command could not be parsed, or its targets could not be determined.
+// gen-md: show-body
 fn opaque_action(action: &Action) -> bool {
     action.is_opaque()
 }
@@ -523,11 +528,13 @@ fn opaque_action(action: &Action) -> bool {
 // ----- `Allow` rules -----
 
 /// The command writes nothing.
+// gen-md: show-body
 fn read_only_action(action: &Action) -> bool {
     action.is_read_only()
 }
 
 /// The command writes, and **every** target it writes is allowed.
+// gen-md: show-body
 fn write_on_allowed_targets(action: &Action) -> bool {
     matches!(action, Action::Write(_)) && action.eval_predicate_all(Target::is_allowed)
 }
@@ -535,6 +542,7 @@ fn write_on_allowed_targets(action: &Action) -> bool {
 // ----- `Deny` rules -----
 
 /// The command writes, and **any** target it writes is protected.
+// gen-md: show-body
 fn write_on_protected_targets(action: &Action) -> bool {
     action.eval_predicate_any(Target::is_protected)
 }
@@ -545,49 +553,52 @@ fn write_on_protected_targets(action: &Action) -> bool {
 
 /// Judges the file dimension.
 ///
-/// Falling through every rule yields [`Outcome::Ask`]: the command was
+/// Falling through every rule yields [`Verdict::Ask`]: the command was
 /// understood, but its targets are neither clearly safe nor clearly protected.
-fn check_action(action: &Action) -> Outcome {
+// gen-md: show-body
+fn check_action(action: &Action) -> Verdict {
     // Short-circuit checks.
     if forbidden_action(action) {
-        return Outcome::Deny;
+        return Verdict::Deny;
     }
     if opaque_action(action) {
-        return Outcome::Ask;
+        return Verdict::Ask;
     }
 
     // `Allow` rules.
     if read_only_action(action) || write_on_allowed_targets(action) {
-        return Outcome::Allow;
+        return Verdict::Allow;
     }
 
     // `Deny` rules.
     if write_on_protected_targets(action) {
-        return Outcome::Deny;
+        return Verdict::Deny;
     }
 
-    Outcome::Ask
+    Verdict::Ask
 }
 
 impl GitAction {
     /// The verdict this git operation contributes on its own.
-    fn outcome(self) -> Outcome {
+    // gen-md: show-body
+    fn verdict(self) -> Verdict {
         match self {
-            GitAction::Read => Outcome::Allow,
+            GitAction::Read => Verdict::Allow,
             // Judged by the file dimension through the repository root.
-            GitAction::StateChange => Outcome::Allow,
-            GitAction::Destructive => Outcome::Ask,
-            GitAction::ConfigWrite => Outcome::Deny,
+            GitAction::StateChange => Verdict::Allow,
+            GitAction::Destructive => Verdict::Ask,
+            GitAction::ConfigWrite => Verdict::Deny,
         }
     }
 }
 
 /// Judges the git dimension: the worst verdict among the git operations found.
-fn check_git(git: &[GitAction]) -> Outcome {
+// gen-md: show-body
+fn check_git(git: &[GitAction]) -> Verdict {
     git.iter()
-        .map(|g| g.outcome())
+        .map(|g| g.verdict())
         .max()
-        .unwrap_or(Outcome::Allow)
+        .unwrap_or(Verdict::Allow)
 }
 
 // -----------------------------------------------------------------------------
@@ -595,7 +606,8 @@ fn check_git(git: &[GitAction]) -> Outcome {
 // -----------------------------------------------------------------------------
 
 /// The verdict for a command: the worse of its two dimensions.
-pub fn check_command(command: impl AsRef<str>) -> Outcome {
+// gen-md: show-body
+pub fn check_command(command: impl AsRef<str>) -> Verdict {
     let Command { action, git } = Command::parse(command);
     check_action(&action).max(check_git(&git))
 }
