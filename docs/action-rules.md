@@ -102,16 +102,14 @@ Branch is a property of a repository, not of a file. Keeping it here rather
 than on `Target` is what allows the four combinations of (tracked?,
 allowed branch?) to be expressed independently.
 
-- **`root: PathBuf`** — Absolute path of the repository's top level.
-- **`branch: Option<String>`** — The checked-out branch, or `None` when `HEAD` is detached.
+- **`facts: Arc<RepoFacts>`** — Everything resolved about the repository: its top level, its checked-out branch (`None` when `HEAD` is detached), the lines of its `allowed-branches` file, and which lane it belongs to. Raw facts only, resolved once per command and shared. Every judgement built on them is made by the predicates below, which is what keeps this module free of the filesystem.
 
 ### `struct Target`
 
 Anything that is a file in the general Unix sense: regular files,
 directories, devices, FIFOs, sockets.
 
-- **`path: PathBuf`** — Absolute, symlink-resolved path.
-- **`repo: Option<Repo>`** — The repository governing this target, or `None` if it is under no repository.
+- **`facts: TargetFacts`** — Everything resolved about the path: its absolute symlink-resolved form, whether it exists, whether it is a directory, the repository governing it (`None` if it is under none), whether it is that repository's top level, whether it is tracked, and how git ignores it. Raw facts only; see `Repo::facts`.
 
 ### `struct TargetedEffect`
 
@@ -138,8 +136,8 @@ Every other git operation is judged by the file rules through its repository
 root, which `Target::is_tracked` reports as tracked.
 
 - **`Read`** — A read-only git invocation. Determined by an **allowlist** of subcommands: anything not on the list is treated as mutating.
-- **`StateChange`** — An ordinary state mutation: `commit`, `merge`, `rebase`, `switch`. Contributes nothing on its own. These are governed by the file dimension through the repository root, which carries the branch rule.
-- **`Destructive`** — Destructive even on an allowed branch: `reset --hard`, `clean -f`, `checkout -- .`, `branch -D`, `stash drop`, `push --force`. Without this, `git clean -fdx` on an allowed branch would be permitted outright while `rm untracked.txt` — a strictly narrower action, deleting a subset of the same files — would ask.
+- **`StateChange`** — An ordinary state mutation: `commit`, `merge`, `rebase`, `switch`, in the repository named, or `None` when it runs under no repository. It carries the branch rule directly, rather than reaching it through the repository root as a file target. Routing it through the root cannot work: the root is protected outright by `Target::is_repo_root`, so nothing reached through it could ever be allowed — and making the root allowable in order to permit `git commit` would make `rm -rf <root>` allowable with it.
+- **`Destructive`** — Destructive even on an allowed branch: `reset --hard`, `clean -f`, `checkout -- .`, `branch -D`, `stash drop`, `push --force`. Without this, `git clean -fdx` on an allowed branch would be permitted outright while `rm untracked.txt` — a strictly narrower action, deleting a subset of the same files — would ask. Carries its repository for the same reason `Self::StateChange` does: on a branch the session does not govern, destroying uncommitted work is worse than an ordinary mutation, not better.
 - **`ConfigWrite`** — A write to git configuration at **any** scope, or a mutation of remotes. Denied unconditionally. `--global` and `--system` write outside every repository; `--local` writes `<repo>/.git/config`, which is neither tracked nor ignored and would otherwise fall into the undecided gap.
 
 ### `struct Command`
@@ -170,12 +168,35 @@ non-blank lines of `<root>/.claude/allowed-branches`. A union, not a
 replacement: adding an entry to that file must never silently withdraw
 permission from the fallback branch.
 
+```rust
+fn allowed_branches(&self) -> Vec<String> {
+    let mut branches = vec![Self::FALLBACK_ALLOWED_BRANCH.to_owned()];
+    branches.extend(
+        self.facts
+            .allowed_branches_file
+            .iter()
+            .filter(|b| b.as_str() != Self::FALLBACK_ALLOWED_BRANCH)
+            .cloned(),
+    );
+    branches
+}
+```
+
 **`fn is_allowed_branch(&self) -> bool`**
 
 The repository's current branch is in `Self::allowed_branches`.
 
 A detached `HEAD` is **not** allowed. It is a state one arrives at by
 accident, and commits made there are unreferenced by default.
+
+```rust
+fn is_allowed_branch(&self) -> bool {
+    match &self.facts.branch {
+        Some(branch) => self.allowed_branches().iter().any(|b| b == branch),
+        None => false,
+    }
+}
+```
 
 **`fn is_launch_project(&self) -> bool`**
 
@@ -187,6 +208,21 @@ cannot move the lane boundary.
 **`fn is_claude_home(&self) -> bool`**
 
 This repository is `$CLAUDE_CONFIG_DIR` (default `~/.claude`).
+
+**`fn is_lane(&self) -> bool`**
+
+This repository is one of the two the session governs by branch.
+
+The Lanes table names exactly two repositories as governed by their own
+branch and gitignore state. In every other repository a branch carries
+no permission at all, which is what stops an allowed branch name in a
+foreign checkout from authorising a write there.
+
+```rust
+fn is_lane(&self) -> bool {
+    self.is_launch_project() || self.is_claude_home()
+}
+```
 
 ## Target predicates
 
@@ -225,11 +261,16 @@ The path exists on disk.
 
 The target is a write sink — see `Self::WRITE_SINK_REGEX_STRS`.
 
+Scoped so as never to overlap `Self::is_protected`, on the same
+grounds as `Self::is_allowed_exception`: whatever a repository root
+happens to be called, it is not a sink.
+
 ```rust
 fn is_write_sink(&self) -> bool {
-    Self::sink_regexes()
-        .iter()
-        .any(|re| re.is_match(self.path_str()))
+    !self.is_repo_root()
+        && Self::sink_regexes()
+            .iter()
+            .any(|re| re.is_match(self.path_str()))
 }
 ```
 
@@ -250,14 +291,30 @@ fn is_allowed_exception(&self) -> bool {
 }
 ```
 
+**`fn location_grants_write(&self) -> bool`**
+
+The target's location grants the write on its own, whatever repository
+it may sit in: a write sink, or a scratch root.
+
+Named because every protected predicate has to exclude it. That
+exclusion is what holds the invariant between the two policy surfaces:
+a location grant is unconditional, so anything that would protect the
+same path has to stand down.
+
+```rust
+fn location_grants_write(&self) -> bool {
+    self.is_write_sink() || self.is_allowed_exception()
+}
+```
+
 **`fn is_tracked(&self) -> bool`**
 
 The target is tracked by its repository.
 
 True for a tracked file, and **also for any directory containing a
 tracked file at any depth**. That is what gives `rm -rf src/` the branch
-rule, and what gives repository-wide git operations — whose target is
-the repository root — a verdict without any git-specific rule.
+rule: a directory's recoverability is the recoverability of what is
+under it.
 
 **`fn is_repo_root(&self) -> bool`**
 
@@ -282,6 +339,16 @@ such as the one in `$CLAUDE_CONFIG_DIR`, where directories are
 explicitly re-included by `!**/` so that git can descend into them while
 every file inside remains ignored.
 
+Scoped so as never to overlap `Self::is_protected`: a repository root
+is excluded, since a repository with nothing tracked in it would
+otherwise be writable whole.
+
+```rust
+fn all_contents_ignored(&self) -> bool {
+    !self.is_repo_root() && self.facts.ignored == Ignored::ContentsRecursivelyIgnored
+}
+```
+
 **`fn is_file_pattern_ignored(&self) -> bool`**
 
 The target is an existing file ignored by a file-level pattern rather
@@ -292,26 +359,73 @@ This is the population that is ignored but *not* reproducible:
 history to recover from; being irreplaceable, it must not be clobbered
 silently. It therefore sits in neither policy surface, and asks.
 
+```rust
+fn is_file_pattern_ignored(&self) -> bool {
+    self.exists() && self.facts.ignored == Ignored::FilePattern
+}
+```
+
 **`fn is_tracked_on_allowed_branch(&self) -> bool`**
 
-The target is in a repository whose branch is allowed, and is tracked.
+The target is in a lane repository whose branch is allowed, and is
+tracked.
+
+A *lane* repository: see `Repo::is_lane`. A branch name in a foreign
+checkout grants nothing, so this cannot overlap
+`Self::is_in_foreign_repo`.
+
+Scoped so as never to overlap `Self::is_protected`: a repository root
+is excluded, since every root with anything tracked in it is tracked by
+`Self::is_tracked`'s recursive reading.
+
+```rust
+fn is_tracked_on_allowed_branch(&self) -> bool {
+    !self.is_repo_root()
+        && self.is_tracked()
+        && self
+            .repo()
+            .is_some_and(|r| r.is_lane() && r.is_allowed_branch())
+}
+```
 
 **`fn is_new_on_allowed_branch(&self) -> bool`**
 
-The target does not yet exist, and lies in a repository whose branch is
-allowed.
+The target does not yet exist, and lies in a lane repository whose
+branch is allowed.
 
 Creating a new file must be possible on an allowed branch. A rule set
 that keys only on tracked-ness cannot express this, because a path that
 does not exist is not tracked.
 
+A *lane* repository, for the same reason as
+`Self::is_tracked_on_allowed_branch`. Nothing further is needed to
+keep it clear of `Self::is_repo_root`: a root that does not exist is
+not a root.
+
+```rust
+fn is_new_on_allowed_branch(&self) -> bool {
+    !self.exists()
+        && self
+            .repo()
+            .is_some_and(|r| r.is_lane() && r.is_allowed_branch())
+}
+```
+
 **`fn is_on_disallowed_branch(&self) -> bool`**
 
 The target is in a repository whose branch is **not** allowed.
 
-Scoped so as never to overlap `Self::is_allowed`: targets under an
-exception path, and targets whose contents are entirely ignored, are
-excluded, since neither depends on history for recovery.
+Scoped so as never to overlap `Self::is_allowed`: targets whose
+location grants the write, and targets whose contents are entirely
+ignored, are excluded, since neither depends on history for recovery.
+
+```rust
+fn is_on_disallowed_branch(&self) -> bool {
+    !self.location_grants_write()
+        && !self.all_contents_ignored()
+        && self.repo().is_some_and(|r| !r.is_allowed_branch())
+}
+```
 
 **`fn is_in_foreign_repo(&self) -> bool`**
 
@@ -322,6 +436,19 @@ Protected, creation included. A second checkout is not the project the
 session was opened against, and the guard has no basis for judging what
 is safe there.
 
+Scoped so as never to overlap `Self::is_allowed`, and scoped exactly
+as `Self::is_on_disallowed_branch` is: a location grant and a wholly
+ignored directory are recoverable wherever they sit, so a checkout under
+`/tmp`, and a foreign checkout's build output, stay writable.
+
+```rust
+fn is_in_foreign_repo(&self) -> bool {
+    !self.location_grants_write()
+        && !self.all_contents_ignored()
+        && self.repo().is_some_and(|r| !r.is_lane())
+}
+```
+
 **`fn is_loose(&self) -> bool`**
 
 The target is under no repository at all, and matches no exception.
@@ -329,6 +456,16 @@ The target is under no repository at all, and matches no exception.
 Protected, creation included. `~/.bashrc`, `/etc/hosts` and the like have
 no version control behind them, so a write there is the least recoverable
 action available.
+
+Both location grants are excluded: `/dev/null` and `/tmp/x` are under no
+repository either, and without the exclusion each would be both allowed
+and protected.
+
+```rust
+fn is_loose(&self) -> bool {
+    self.repo().is_none() && !self.location_grants_write()
+}
+```
 
 #### Policy surfaces
 
@@ -376,7 +513,7 @@ fn is_protected(&self) -> bool {
 
 ### `impl Command`
 
-**`fn parse(_command: impl AsRef<str>) -> Command`**
+**`fn parse(command: impl AsRef<str>, cwd: impl AsRef<Path>) -> Command`**
 
 Parses a command string into both dimensions.
 
@@ -392,6 +529,19 @@ severe reading of a command wins:
 The git dimension collects one `GitAction` per git invocation found,
 independently of the above; it is composed with the file verdict rather
 than ranked against it, so neither dimension can mask the other.
+
+`cwd` is the working directory relative paths are taken against, and
+nothing else: it never decides which lane a target is in. Passing it
+rather than reading it from the environment is what keeps the guard from
+inheriting the previous one's defect, where the hook process's own
+working directory silently chose the repository a command was judged
+against.
+
+The scanning itself lives in `crate::parse`, and the facts its targets
+carry come from `crate::facts`. This is the one function here that
+reaches outside the module — turning a string into judgeable data is
+exactly the boundary, and everything below it is a pure function of what
+comes back.
 
 ## Rules
 
@@ -486,19 +636,35 @@ fn check_action(action: &Action) -> Verdict {
 
 ### `impl GitAction`
 
-**`fn verdict(self) -> Verdict`**
+**`fn verdict(&self) -> Verdict`**
 
 The verdict this git operation contributes on its own.
 
 ```rust
-fn verdict(self) -> Verdict {
+fn verdict(&self) -> Verdict {
     match self {
         GitAction::Read => Verdict::Allow,
-        // Judged by the file dimension through the repository root.
-        GitAction::StateChange => Verdict::Allow,
-        GitAction::Destructive => Verdict::Ask,
+        GitAction::StateChange(repo) if governed(repo) => Verdict::Allow,
+        GitAction::StateChange(_) => Verdict::Deny,
+        GitAction::Destructive(repo) if governed(repo) => Verdict::Ask,
+        GitAction::Destructive(_) => Verdict::Deny,
         GitAction::ConfigWrite => Verdict::Deny,
     }
+}
+```
+
+**`fn governed(repo: &Option<Repo>) -> bool`**
+
+The repository a git operation runs in is one the session may change.
+
+Running under no repository is governed: there is no branch to protect, and
+whatever files the operation touches are judged by the file dimension in the
+ordinary way.
+
+```rust
+fn governed(repo: &Option<Repo>) -> bool {
+    repo.as_ref()
+        .is_none_or(|r| r.is_lane() && r.is_allowed_branch())
 }
 ```
 
@@ -517,13 +683,28 @@ fn check_git(git: &[GitAction]) -> Verdict {
 
 ## Command checking
 
-**`pub fn check_command(command: impl AsRef<str>) -> Verdict`**
+**`pub fn check(command: &Command) -> Verdict`**
 
-The verdict for a command: the worse of its two dimensions.
+The verdict for an already-classified command: the worse of its two
+dimensions.
+
+The entry point for a caller that builds its own `Command`. The file tools
+deliver a `file_path` rather than a command line, and are turned into an
+`Action::Write` over a single `TargetedEffect` so that both entry points
+are judged by one rule table rather than two that can drift apart.
 
 ```rust
-pub fn check_command(command: impl AsRef<str>) -> Verdict {
-    let Command { action, git } = Command::parse(command);
-    check_action(&action).max(check_git(&git))
+pub fn check(command: &Command) -> Verdict {
+    check_action(&command.action).max(check_git(&command.git))
+}
+```
+
+**`pub fn check_command(command: impl AsRef<str>, cwd: impl AsRef<Path>) -> Verdict`**
+
+The verdict for a command string.
+
+```rust
+pub fn check_command(command: impl AsRef<str>, cwd: impl AsRef<Path>) -> Verdict {
+    check(&Command::parse(command, cwd))
 }
 ```

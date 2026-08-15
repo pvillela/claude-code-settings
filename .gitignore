@@ -9,8 +9,7 @@
 !.gitignore
 !skills/**
 !CLAUDE.md
-!global-git-guard.sh
-!guard_test.sh
+!action-guard.sh
 !LICENSE
 !README.md
 !rustfmt-on-edit.sh

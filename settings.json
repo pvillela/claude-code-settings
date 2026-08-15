@@ -27,7 +27,17 @@
   },
   "model": "opus",
   "hooks": {
-    "PreToolUse": [],
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash $HOME/.claude/action-guard.sh"
+          }
+        ]
+      }
+    ],
     "PostToolUse": [
       {
         "matcher": "Edit|Write|MultiEdit",
@@ -35,6 +45,16 @@
           {
             "type": "command",
             "command": "bash $HOME/.claude/rustfmt-on-edit.sh"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash $HOME/.claude/action-rules/build.sh >/dev/null 2>&1"
           }
         ]
       }

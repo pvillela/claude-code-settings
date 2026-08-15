@@ -6,7 +6,18 @@ edition = "2024"
 [dependencies]
 regex = "1.13.1"
 
+# Used only by the `action-guard` binary, to read the `PreToolUse` payload and
+# to build the decision object. The rule spec itself does no serialisation.
+serde_json = "1"
+
 # Used only by the `gen-md` binary, which renders the doc comments in
 # `action_rules` to Markdown. Not used by the rule spec itself.
 syn = { version = "2", features = ["full", "parsing", "extra-traits"] }
 proc-macro2 = { version = "1", features = ["span-locations"] }
+
+[profile.release]
+# The guard runs on every tool call; startup cost is what matters, not
+# throughput. Thin LTO and one codegen unit keep the binary small and fast to
+# load without a long build.
+lto = "thin"
+codegen-units = 1
