@@ -57,8 +57,19 @@ for pair in "$A:aicode" "$D:main"; do
   mkdir -p "$dir/ignored-dir" && echo x > "$dir/ignored-dir/untracked-but-ignored.md"
   # Wholly ignored, and non-empty: the build-output case.
   mkdir -p "$dir/target/debug" && echo bin > "$dir/target/debug/app"
-  # Ignored by a pattern of its own, and existing: the population that asks.
+  # Ignored by a pattern of its own, and existing: the irreplaceable population.
   echo log > "$dir/app.log"
+  # A directory that ignores its own contents from within. NOT a
+  # gitignored_allowed_dir: git never applies data/.gitignore to data, so
+  # nothing above it ever declared it reproducible.
+  mkdir -p "$dir/data" && printf '*\n' > "$dir/data/.gitignore"
+  echo secret > "$dir/data/notes.csv"
+  # Undeclared itself, but everything under it is reproducible build output.
+  mkdir -p "$dir/reproducible/target/debug" && echo bin > "$dir/reproducible/target/debug/app"
+  # A tracked directory hiding an irreplaceable file: the exception.
+  mkdir -p "$dir/mixed" && echo keep > "$dir/mixed/keep.txt"
+  git -C "$dir" add mixed/keep.txt && git -C "$dir" commit -qm mixed
+  echo log > "$dir/mixed/debug.log"
 done
 
 # F: a second checkout, on an allowed branch, that is never the launch project.
@@ -95,14 +106,19 @@ commit_all "$H" init
 git -C "$H" checkout -q --detach HEAD
 
 # CH: the $CLAUDE_CONFIG_DIR stand-in, on a disallowed branch deliberately, with
-# the deny-all-then-allowlist .gitignore that the contents test exists for.
+# the deny-all-then-allowlist .gitignore the real one uses. `!*/` re-includes
+# every directory so git can descend, which is exactly why a machine-written
+# directory has to be declared explicitly to become a gitignored_allowed_dir.
 CH="$ROOT/claudehome"
 git_init "$CH" main
-printf '*\n!*/\n!**/\n!.gitignore\n!CLAUDE.md\n' > "$CH/.gitignore"
+printf '*\n!*/\n!**/\n!.gitignore\n!CLAUDE.md\nprojects/\n' > "$CH/.gitignore"
 echo doc > "$CH/CLAUDE.md"
 commit_all "$CH" init
 mkdir -p "$CH/projects/someproj/memory"
 echo mem > "$CH/projects/someproj/memory/MEMORY.md"
+# Ignored by the catch-all `*`, in a directory nothing declared: irreplaceable.
+mkdir -p "$CH/undeclared"
+echo note > "$CH/undeclared/note.md"
 echo '{}' > "$CH/settings.local.json"
 
 # LOOSE: under no repository, and not under an exception path.
@@ -224,7 +240,7 @@ run "$D" "$D" 'sed -i s/a/b/ tracked.txt' deny
 run "$D" "$D" 'cp /etc/hostname tracked.txt' deny
 run "$D" "$D" 'rm -rf src' deny
 
-echo "== Target::all_contents_ignored: build output, on any branch =="
+echo "== Target::is_under_gitignored_allowed_dir: build output, on any branch =="
 runw "$A" "$A" "$A/target/debug/app" allow
 runw "$D" "$D" "$D/target/debug/app" allow
 runw "$D" "$D" "$D/target/debug/brand-new" allow
@@ -233,20 +249,40 @@ run "$A" "$A" 'echo hi > ignored-dir/untracked-but-ignored.md' allow
 run "$D" "$D" 'echo hi > ignored-dir/untracked-but-ignored.md' allow
 
 echo "== Target::is_file_pattern_ignored: ignored, existing, irreplaceable =="
-runw "$A" "$A" "$A/app.log" ask
-run "$A" "$A" 'rm app.log' ask
-echo "== ... but the branch still decides first =="
+runw "$A" "$A" "$A/app.log" deny
+run "$A" "$A" 'rm app.log' deny
 runw "$D" "$D" "$D/app.log" deny
 
-echo "== The gap: an existing untracked file is neither allowed nor protected =="
-runw "$A" "$A" "$A/untracked.txt" ask
-run "$A" "$A" 'echo hi > untracked.txt' ask
-run "$A" "$A" 'echo hi >> untracked.txt' ask
-run "$A" "$A" 'cp /etc/hostname untracked.txt' ask
-run "$A" "$A" 'rm untracked.txt' ask
+echo "== A directory that ignores itself from within grants nothing =="
+runw "$A" "$A" "$A/data/notes.csv" deny
+run "$A" "$A" 'echo x > data/notes.csv' deny
+run "$A" "$A" 'rm data/notes.csv' deny
 
-echo "== One protected target condemns the command; one undecided target asks =="
-run "$A" "$A" 'sed -i s/a/b/ tracked.txt untracked.txt' ask
+echo "== A directory is judged by what it holds =="
+# Removing the directory is no cheaper than removing the files inside it.
+run "$A" "$A" 'rm -rf data' deny
+# Reproducible contents do not condemn their directory: holds only target/.
+run "$A" "$A" 'rm -rf reproducible' allow
+# The exception: tracked content takes precedence over what is hidden inside.
+run "$A" "$A" 'rm -rf mixed' allow
+run "$D" "$D" 'rm -rf mixed' deny
+# Naming the files individually reaches the ignored one, and is denied.
+run "$A" "$A" 'rm -rf mixed/*' deny
+
+echo "== An existing untracked file is allowed on an allowed branch =="
+# Almost always a file the session itself created: the first write to a path
+# that did not exist is allowed, and the second finds it existing.
+runw "$A" "$A" "$A/untracked.txt" allow
+run "$A" "$A" 'echo hi > untracked.txt' allow
+run "$A" "$A" 'echo hi >> untracked.txt' allow
+run "$A" "$A" 'cp /etc/hostname untracked.txt' allow
+run "$A" "$A" 'rm untracked.txt' allow
+echo "== ... but the branch still decides first =="
+runw "$D" "$D" "$D/untracked.txt" deny
+run "$D" "$D" 'rm untracked.txt' deny
+
+echo "== One protected target condemns the whole command =="
+run "$A" "$A" 'sed -i s/a/b/ tracked.txt untracked.txt' allow
 run "$A" "$A" "sed -i s/a/b/ tracked.txt $LOOSE/file.txt" deny
 run "$A" "$A" 'rm tracked.txt target/debug/app' allow
 
@@ -264,6 +300,8 @@ runw "$CH" "$A" "$CH/projects/someproj/memory/MEMORY.md" allow
 runw "$CH" "$A" "$CH/projects/someproj/memory/brand-new.md" allow
 runw "$CH" "$A" "$CH/CLAUDE.md" deny
 runw "$CH" "$A" "$CH/settings.local.json" deny
+# Ignored, but under no declared directory: protected, not reproducible.
+runw "$CH" "$A" "$CH/undeclared/note.md" deny
 run "$CH" "$A" "sed -i s/a/b/ $CH/CLAUDE.md" deny
 
 # =============================================================================
@@ -413,7 +451,7 @@ echo
 echo "== Both dimensions compose; neither masks the other =="
 run "$A" "$A" 'echo hi > /tmp/x && git config --global a.b c' deny
 run "$A" "$A" 'git status && echo hi > tracked.txt' allow
-run "$A" "$A" 'git status && rm untracked.txt' ask
+run "$A" "$A" 'git status && rm untracked.txt' allow
 
 echo
 echo "passed $pass, failed $fail"

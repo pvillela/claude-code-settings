@@ -104,11 +104,11 @@ fn a_scratch_path_is_allowed() {
 }
 
 #[test]
-fn a_wholly_ignored_directory_is_allowed_on_any_branch() {
+fn a_gitignored_directory_is_allowed_on_any_branch() {
     let mut facts = target("/repo/target/debug/x");
     facts.repo = Some(repo_facts(Lane::Launch, Some("main")));
     facts.exists = true;
-    facts.ignored = Ignored::ContentsRecursivelyIgnored;
+    facts.ignored = Ignored::UnderGitignoredDir;
 
     let (allowed, protected) = judge(facts);
     assert!(allowed && !protected);
@@ -199,26 +199,84 @@ fn a_disallowed_branch_protects_tracked_and_new_alike() {
 // -----------------------------------------------------------------------------
 
 #[test]
-fn a_file_pattern_ignored_file_neither_allows_nor_protects() {
+fn an_existing_file_pattern_ignored_file_is_protected() {
     let mut facts = target("/repo/data/secret.xlsx");
     facts.repo = Some(repo_facts(Lane::Launch, Some("aicode")));
     facts.exists = true;
     facts.ignored = Ignored::FilePattern;
 
     let (allowed, protected) = judge(facts.clone());
-    assert!(!allowed && !protected);
-    assert_eq!(check_action(&write(facts)), Verdict::Ask);
+    assert!(!allowed && protected);
+    assert_eq!(check_action(&write(facts)), Verdict::Deny);
 }
 
+/// The scoping that keeps [`Target::is_file_pattern_ignored`] clear of
+/// [`Target::is_allowed`]: a repository under `/tmp` is still scratch space.
 #[test]
-fn an_untracked_existing_file_on_an_allowed_branch_asks() {
+fn an_ignored_file_in_a_scratch_repository_is_allowed() {
+    let mut facts = target("/tmp/repo/app.log");
+    facts.repo = Some(repo_facts(Lane::Foreign, Some("main")));
+    facts.exists = true;
+    facts.ignored = Ignored::FilePattern;
+
+    let (allowed, protected) = judge(facts);
+    assert!(allowed && !protected);
+}
+
+/// A directory carrying the label from what it holds is protected like the
+/// files themselves, so removing it is no cheaper than removing them one by
+/// one.
+#[test]
+fn a_directory_holding_an_irreplaceable_file_is_protected() {
+    let mut facts = target("/repo/data");
+    facts.repo = Some(repo_facts(Lane::Launch, Some("aicode")));
+    facts.exists = true;
+    facts.is_dir = true;
+    facts.ignored = Ignored::FilePattern;
+
+    let (allowed, protected) = judge(facts);
+    assert!(!allowed && protected);
+}
+
+/// The exception: tracked content takes precedence, so an ordinary source
+/// directory stays writable on an allowed branch.
+#[test]
+fn a_tracked_directory_is_judged_by_branch_not_by_what_it_hides() {
+    let mut facts = target("/repo/src");
+    facts.repo = Some(repo_facts(Lane::Launch, Some("aicode")));
+    facts.exists = true;
+    facts.is_dir = true;
+    facts.tracked = true;
+    facts.ignored = Ignored::No;
+
+    let (allowed, protected) = judge(facts);
+    assert!(allowed && !protected);
+}
+
+/// Clobbering is the irreversible act, so an ignored path that does not exist
+/// yet is created like any other new file.
+#[test]
+fn a_new_ignored_path_on_an_allowed_branch_is_allowed() {
+    let mut facts = target("/repo/new.log");
+    facts.repo = Some(repo_facts(Lane::Launch, Some("aicode")));
+    facts.exists = false;
+    facts.ignored = Ignored::FilePattern;
+
+    let (allowed, protected) = judge(facts);
+    assert!(allowed && !protected);
+}
+
+/// Almost always a file the session created earlier, since the first write to
+/// a path that did not exist is allowed outright.
+#[test]
+fn an_untracked_existing_file_on_an_allowed_branch_is_allowed() {
     let mut facts = target("/repo/src/scratch.rs");
     facts.repo = Some(repo_facts(Lane::Launch, Some("aicode")));
     facts.exists = true;
 
     let (allowed, protected) = judge(facts.clone());
-    assert!(!allowed && !protected);
-    assert_eq!(check_action(&write(facts)), Verdict::Ask);
+    assert!(allowed && !protected);
+    assert_eq!(check_action(&write(facts)), Verdict::Allow);
 }
 
 // -----------------------------------------------------------------------------
@@ -246,8 +304,13 @@ fn well_formed(facts: &TargetFacts) -> bool {
     true
 }
 
-#[test]
-fn no_target_is_both_allowed_and_protected() {
+/// Calls `f` on every combination of facts the resolver could actually produce.
+///
+/// The axes are the facts the predicates read, so the product covers the
+/// predicate space rather than a sample of it. Combinations `well_formed`
+/// rejects are skipped: they are states the resolver cannot emit, and asserting
+/// anything about them would be asserting about nothing.
+fn for_each_well_formed(mut f: impl FnMut(&TargetFacts)) {
     let lanes = [
         None,
         Some((Lane::Launch, Some("aicode"))),
@@ -267,7 +330,7 @@ fn no_target_is_both_allowed_and_protected() {
     ];
     let ignoreds = [
         Ignored::No,
-        Ignored::ContentsRecursivelyIgnored,
+        Ignored::UnderGitignoredDir,
         Ignored::FilePattern,
     ];
 
@@ -290,11 +353,7 @@ fn no_target_is_both_allowed_and_protected() {
                                     continue;
                                 }
                                 checked += 1;
-                                let (allowed, protected) = judge(facts.clone());
-                                assert!(
-                                    !(allowed && protected),
-                                    "both allowed and protected: {facts:?}"
-                                );
+                                f(&facts);
                             }
                         }
                     }
@@ -306,6 +365,17 @@ fn no_target_is_both_allowed_and_protected() {
         checked > 500,
         "only {checked} combinations were well-formed"
     );
+}
+
+#[test]
+fn no_target_is_both_allowed_and_protected() {
+    for_each_well_formed(|facts| {
+        let (allowed, protected) = judge(facts.clone());
+        assert!(
+            !(allowed && protected),
+            "both allowed and protected: {facts:?}"
+        );
+    });
 }
 
 // -----------------------------------------------------------------------------
@@ -333,18 +403,22 @@ fn one_protected_target_condemns_the_whole_command() {
     assert_eq!(check_action(&action), Verdict::Deny);
 }
 
+/// The file dimension now decides every target it recognises.
+///
+/// `check_action` still falls through to `Verdict::Ask`, and that fall-through
+/// is a safety net rather than dead code: removing any disjunct of
+/// `Target::is_allowed` — the `POLICY:` comments invite exactly that — reopens
+/// the gap and this test is what says so.
 #[test]
-fn one_undecided_target_takes_the_command_to_ask() {
-    let allowed = target("/tmp/x");
-    let mut undecided = target("/repo/src/scratch.rs");
-    undecided.repo = Some(repo_facts(Lane::Launch, Some("aicode")));
-    undecided.exists = true;
-
-    let action = Action::Write(vec![
-        TargetedEffect::new(Target::new(allowed), Effect::Change),
-        TargetedEffect::new(Target::new(undecided), Effect::Change),
-    ]);
-    assert_eq!(check_action(&action), Verdict::Ask);
+fn the_file_dimension_leaves_no_target_undecided() {
+    let mut gap = 0;
+    for_each_well_formed(|facts| {
+        let (allowed, protected) = judge(facts.clone());
+        if !allowed && !protected {
+            gap += 1;
+        }
+    });
+    assert_eq!(gap, 0, "{gap} targets are neither allowed nor protected");
 }
 
 #[test]

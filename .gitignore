@@ -13,8 +13,25 @@
 !LICENSE
 !README.md
 !rustfmt-on-edit.sh
+!uncommitted-at-start.sh
 !settings.json
 !statusline-command.sh
 
 !action-rules/**
 !docs/**
+
+# 4. Machine-written directories. Declared as ignored folders so the guard's
+# `gitignored_allowed_dir` rule permits session writes to them.
+backups/
+cache/
+downloads/
+file-history/
+ide/
+paste-cache/
+plans/
+plugins/
+projects/
+session-env/
+sessions/
+shell-snapshots/
+tasks/

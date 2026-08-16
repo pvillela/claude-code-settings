@@ -37,13 +37,19 @@ Composing rather than ranking the two means neither can mask the other.
 layer; it is produced in exactly two places:
 
 - `Action::Opaque`, when the parser cannot determine what a command does.
+- `GitAction::Destructive`, which asks even where the branch rule permits.
 - The gap between `Target::is_allowed` and `Target::is_protected`, which
   are **not** complements. A target that satisfies neither is one the rules
   recognise but decline to decide, and it is handed to the user.
 
-Keeping the gap explicit is the point: a two-valued design would force every
-recognised-but-undecided case to resolve as *allow* (defeating the guard) or
-*deny* (obstructing ordinary work).
+**The gap is currently empty.** Every target the resolver can produce is now
+either allowed or protected, so a command whose targets are all understood
+never asks; `Ask` reaches the user only by the two routes above. The gap is
+kept in the design regardless, because it is what any future policy change
+falls into: a two-valued design would force every recognised-but-undecided
+case to resolve as *allow* (defeating the guard) or *deny* (obstructing
+ordinary work). Removing any disjunct of `Target::is_allowed` — which the
+`POLICY:` comments invite — reopens it, and a test asserts as much.
 
 ## Lanes
 
@@ -324,44 +330,94 @@ Always protected. The branch rule's premise is that changes to tracked
 files are recoverable from history; removing the repository root removes
 the `.git` directory that premise depends on.
 
-**`fn all_contents_ignored(&self) -> bool`**
+**`fn is_under_gitignored_allowed_dir(&self) -> bool`**
 
-The target is a directory every file under which is ignored, or is
-itself under such a directory.
+The target is a directory git reports as ignored — a
+*gitignored allowed dir* — or lies under one.
 
 This is the build-output case: `target/`, `node_modules/`, `dist/`.
 Contents are reproducible, so they may be written and removed freely on
 any branch.
 
-The test is over **contents**, not over the directory path. Testing the
-path gives the wrong answer under a deny-all-then-allowlist `.gitignore`
-such as the one in `$CLAUDE_CONFIG_DIR`, where directories are
-explicitly re-included by `!**/` so that git can descend into them while
-every file inside remains ignored.
+The test is over the **directory's own path**, and the grant has to come
+from above it. Git never applies `D/.gitignore` to `D` itself, so
+`git check-ignore D` answers exactly the right question: a directory is
+ignored only when some `.gitignore` in an ancestor directory says so.
+The distinction is the whole point of the predicate. A `data/` directory
+whose own `.gitignore` reads `*` has every file inside it ignored, but
+nothing above it ever declared it reproducible — those files are
+irreplaceable, and `Self::is_file_pattern_ignored` protects them.
+
+A directory a deny-all-then-allowlist `.gitignore` re-includes by `!**/`
+is likewise not one of these, so `$CLAUDE_CONFIG_DIR` declares its
+machine-written directories explicitly.
 
 Scoped so as never to overlap `Self::is_protected`: a repository root
 is excluded, since a repository with nothing tracked in it would
 otherwise be writable whole.
 
 ```rust
-fn all_contents_ignored(&self) -> bool {
-    !self.is_repo_root() && self.facts.ignored == Ignored::ContentsRecursivelyIgnored
+fn is_under_gitignored_allowed_dir(&self) -> bool {
+    !self.is_repo_root() && self.facts.ignored == Ignored::UnderGitignoredDir
 }
 ```
 
 **`fn is_file_pattern_ignored(&self) -> bool`**
 
-The target is an existing file ignored by a file-level pattern rather
-than by a recursively-ignored directory.
+The target is ignored by a pattern of its own rather than by a
+gitignored directory — see `Self::is_under_gitignored_allowed_dir` —
+or is a directory holding such a file at any depth.
 
 This is the population that is ignored but *not* reproducible:
 `devcontainer.env`, `data/*.xlsx`, credentials. Being ignored, it has no
-history to recover from; being irreplaceable, it must not be clobbered
-silently. It therefore sits in neither policy surface, and asks.
+history to recover from; being irreplaceable, it cannot be reconstructed
+either. It is therefore the least recoverable target inside a repository,
+and is protected.
+
+## A directory is judged by what it holds
+
+A directory carries this too, whenever it holds a gitignored file that
+no tool can regenerate. Without that, `rm data/notes.csv` would be
+denied while `rm -rf data` — which destroys the same file, and every one
+of its neighbours — would merely ask. The reading is the one
+`Self::is_tracked` already takes: a directory's recoverability is the
+recoverability of what is under it.
+
+Gitignored is the operative word, and it is not the same as untracked. A
+new file that git merely does not track yet has no history either, but
+git can see it and will offer to commit it, so it is on its way into
+version control rather than kept out of it. Those ask, and so does the
+directory holding them.
+
+Build output has a way to be rebuilt, so it never puts the label on the
+directory above it. Every file under a gitignored directory has that
+directory as an ancestor, which is what makes it reproducible, so
+`target/debug/app` leaves `target/` alone and a `data/` holding nothing
+but `data/target/` stays in the gap.
+
+**The exception: tracked content takes precedence.** A directory holding
+anything git tracks is judged by the branch rule instead, and stays
+writable on an allowed branch. `rm -rf src` therefore still works, even
+with a `src/.env` inside it. This is deliberate, and it is the one place
+where an irreplaceable file goes unprotected. The alternative is worse:
+stray `*.log` files are common enough that protecting every directory
+holding one would deny `rm -rf` almost everywhere, and a guard that
+refuses ordinary work is one that gets switched off.
+
+## Scope
+
+Existence is required because clobbering is the irreversible act.
+Creating a file at an ignored path destroys nothing, so a path that does
+not exist stays with `Self::is_new_on_allowed_branch` — which is also
+what keeps the two disjoint.
+
+Scoped so as never to overlap `Self::is_allowed`: a target whose
+location grants the write is excluded, so an ignored file in a
+repository under `/tmp` stays writable.
 
 ```rust
 fn is_file_pattern_ignored(&self) -> bool {
-    self.exists() && self.facts.ignored == Ignored::FilePattern
+    !self.location_grants_write() && self.exists() && self.facts.ignored == Ignored::FilePattern
 }
 ```
 
@@ -388,6 +444,45 @@ fn is_tracked_on_allowed_branch(&self) -> bool {
 }
 ```
 
+**`fn is_untracked_on_allowed_branch(&self) -> bool`**
+
+The target is an existing file in a lane repository on an allowed
+branch, and git neither tracks nor ignores it.
+
+Almost every file in this population was created by the session itself:
+`Self::is_new_on_allowed_branch` permits the first write, and the
+second write to the same path finds a file that now exists. Keying on
+existence therefore asks about the session's own output, which is noise
+rather than protection.
+
+The cost is real and is accepted deliberately. A file **you** wrote by
+hand and have not committed is in the same population, and this allows it
+to be overwritten without a prompt. The mitigation is at the other end:
+a `SessionStart` hook lists the uncommitted files that already exist and
+raises them before any work begins, so the choice to leave them
+unprotected is made once, knowingly, rather than assumed on every write.
+
+Gitignored files are excluded, and stay with
+`Self::is_file_pattern_ignored`: an ignore entry is a standing decision
+to keep a file out of version control, so it will never gain the history
+this disjunct assumes is coming.
+
+Scoped so as never to overlap `Self::is_protected`: a repository root
+is excluded, since the root of a repository with nothing committed to it
+is untracked, and would otherwise be writable whole.
+
+```rust
+fn is_untracked_on_allowed_branch(&self) -> bool {
+    !self.is_repo_root()
+        && self.exists()
+        && !self.is_tracked()
+        && self.facts.ignored == Ignored::No
+        && self
+            .repo()
+            .is_some_and(|r| r.is_lane() && r.is_allowed_branch())
+}
+```
+
 **`fn is_new_on_allowed_branch(&self) -> bool`**
 
 The target does not yet exist, and lies in a lane repository whose
@@ -401,6 +496,11 @@ A *lane* repository, for the same reason as
 `Self::is_tracked_on_allowed_branch`. Nothing further is needed to
 keep it clear of `Self::is_repo_root`: a root that does not exist is
 not a root.
+
+This is also where an ignored path that does not exist yet lands, and
+deliberately so: creating `devcontainer.env` or a fresh `*.log` destroys
+nothing, while overwriting one is what
+`Self::is_file_pattern_ignored` protects against.
 
 ```rust
 fn is_new_on_allowed_branch(&self) -> bool {
@@ -416,13 +516,13 @@ fn is_new_on_allowed_branch(&self) -> bool {
 The target is in a repository whose branch is **not** allowed.
 
 Scoped so as never to overlap `Self::is_allowed`: targets whose
-location grants the write, and targets whose contents are entirely
-ignored, are excluded, since neither depends on history for recovery.
+location grants the write, and targets under a gitignored directory, are
+excluded, since neither depends on history for recovery.
 
 ```rust
 fn is_on_disallowed_branch(&self) -> bool {
     !self.location_grants_write()
-        && !self.all_contents_ignored()
+        && !self.is_under_gitignored_allowed_dir()
         && self.repo().is_some_and(|r| !r.is_allowed_branch())
 }
 ```
@@ -437,14 +537,14 @@ session was opened against, and the guard has no basis for judging what
 is safe there.
 
 Scoped so as never to overlap `Self::is_allowed`, and scoped exactly
-as `Self::is_on_disallowed_branch` is: a location grant and a wholly
-ignored directory are recoverable wherever they sit, so a checkout under
-`/tmp`, and a foreign checkout's build output, stay writable.
+as `Self::is_on_disallowed_branch` is: a location grant and a
+gitignored directory are recoverable wherever they sit, so a checkout
+under `/tmp`, and a foreign checkout's build output, stay writable.
 
 ```rust
 fn is_in_foreign_repo(&self) -> bool {
     !self.location_grants_write()
-        && !self.all_contents_ignored()
+        && !self.is_under_gitignored_allowed_dir()
         && self.repo().is_some_and(|r| !r.is_lane())
 }
 ```
@@ -482,9 +582,10 @@ satisfying neither is referred to the user.
 fn is_allowed(&self) -> bool {
     self.is_write_sink()
         || self.is_allowed_exception()
-        || self.all_contents_ignored()
+        || self.is_under_gitignored_allowed_dir()
         || self.is_tracked_on_allowed_branch()
         || self.is_new_on_allowed_branch()
+        || self.is_untracked_on_allowed_branch()
 }
 ```
 
@@ -504,8 +605,9 @@ fn is_protected(&self) -> bool {
         // rather than deny.
         || self.is_in_foreign_repo()
         || self.is_on_disallowed_branch()
-    // POLICY: add `|| self.is_file_pattern_ignored()` to deny writes to
-    // ignored-but-irreplaceable files rather than asking about them.
+        // POLICY: remove this disjunct to make ignored-but-irreplaceable
+        // files ask rather than deny.
+        || self.is_file_pattern_ignored()
 }
 ```
 

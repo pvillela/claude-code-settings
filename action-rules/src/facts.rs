@@ -31,11 +31,18 @@ use std::{
 pub enum Ignored {
     /// Not ignored.
     No,
-    /// The path is a directory every file under which is ignored, or lies
-    /// under such a directory.
-    ContentsRecursivelyIgnored,
+    /// The path is a directory git reports as ignored, or lies under one.
+    ///
+    /// "Git reports the directory as ignored" is the whole test, and it is a
+    /// test on the directory's own path rather than on what it holds. It says
+    /// exactly what it should: git never applies `D/.gitignore` to `D` itself,
+    /// so a directory is ignored only when something *above* it says so. A
+    /// `data/` whose own `.gitignore` reads `*` therefore does not qualify —
+    /// its contents are ignored, but nothing declared the directory
+    /// reproducible.
+    UnderGitignoredDir,
     /// The path is ignored by a pattern that matches it directly, without any
-    /// ancestor directory being recursively ignored.
+    /// ancestor directory being ignored.
     FilePattern,
 }
 
@@ -209,21 +216,37 @@ fn literal_pathspec(rel: &Path) -> OsString {
 
 /// What one repository reports about the subtrees a command touches.
 ///
-/// Both sets are relative to the repository root, and both are bounded by the
-/// pathspecs in `scopes` — the top-level directories the command names — so a
+/// Paths are relative to the repository root, and every listing is bounded by
+/// the pathspecs already queried — the directories the command names — so a
 /// large repository is never listed in full.
 #[derive(Default)]
 struct Listing {
     /// Tracked paths under the queried scopes.
     tracked: HashSet<PathBuf>,
-    /// Untracked, non-ignored paths under the queried scopes.
-    untracked: HashSet<PathBuf>,
-    /// Scopes already queried.
+    /// Scopes already queried for tracked paths.
     scopes: HashSet<PathBuf>,
+    /// Ignored files under the queried directory scopes.
+    ///
+    /// Collected only for directories the command writes to, since only a
+    /// directory is judged by what it holds.
+    ignored_files: HashSet<PathBuf>,
+    /// Directory scopes already queried for ignored files.
+    ignored_file_scopes: HashSet<PathBuf>,
     /// Paths `git check-ignore` matched, among those asked about.
     ignored: HashSet<PathBuf>,
     /// Paths already asked about with `check-ignore`.
     ignore_queried: HashSet<PathBuf>,
+}
+
+/// The queries one repository needs, accumulated before any of them is issued.
+#[derive(Default)]
+struct Queries {
+    /// Top-level directories to list tracked paths under.
+    scopes: HashSet<PathBuf>,
+    /// Directories to list ignored files under.
+    ignored_files: HashSet<PathBuf>,
+    /// Paths to ask `check-ignore` about.
+    check_ignore: HashSet<PathBuf>,
 }
 
 // -----------------------------------------------------------------------------
@@ -323,8 +346,9 @@ impl Resolver {
 
     /// Resolves every path of one command together.
     ///
-    /// Batched rather than resolved one at a time: the two listings a
-    /// repository needs are issued once for all the targets that share it.
+    /// Batched rather than resolved one at a time: the listing and the
+    /// `check-ignore` query a repository needs are issued once for all the
+    /// targets that share it.
     pub fn resolve_all(&mut self, paths: &[PathBuf]) -> Result<Vec<TargetFacts>, String> {
         let normalized: Vec<PathBuf> = paths.iter().map(|p| self.normalize(p)).collect();
 
@@ -333,9 +357,9 @@ impl Resolver {
             repos.push(self.repo_facts_for(path)?);
         }
 
-        // Batch: every scope and every check-ignore query, grouped by
-        // repository, issued before any target is judged.
-        let mut wanted: HashMap<PathBuf, (HashSet<PathBuf>, HashSet<PathBuf>)> = HashMap::new();
+        // Batch: every query a repository needs, grouped by repository and
+        // issued before any target is judged.
+        let mut wanted: HashMap<PathBuf, Queries> = HashMap::new();
         for (path, repo) in normalized.iter().zip(&repos) {
             let Some(repo) = repo else { continue };
             let Some(rel) = relative(&repo.root, path) else {
@@ -346,18 +370,36 @@ impl Resolver {
             }
             let entry = wanted.entry(repo.root.clone()).or_default();
             if let Some(first) = rel.components().next() {
-                entry.0.insert(PathBuf::from(first.as_os_str()));
+                entry.scopes.insert(PathBuf::from(first.as_os_str()));
             }
             // check-ignore is asked about the target and about every ancestor
             // directory that stands between it and the repository root.
             for anc in ancestors_within(&rel) {
-                entry.1.insert(anc);
+                entry.check_ignore.insert(anc);
             }
-            entry.1.insert(rel);
+            entry.check_ignore.insert(rel.clone());
+            // A directory is judged by what it holds, so its ignored files are
+            // listed too. Only for a directory: for anything else the question
+            // does not arise, and the listing is the most expensive query here.
+            if path.is_dir() {
+                entry.ignored_files.insert(rel);
+            }
         }
-        for (root, (scopes, queries)) in &wanted {
-            self.load_listing(root, scopes)?;
-            self.load_check_ignore(root, queries)?;
+        for (root, queries) in &mut wanted {
+            self.load_listing(root, &queries.scopes)?;
+            self.load_ignored_files(root, &queries.ignored_files)?;
+            // Deciding whether an ignored file is reproducible means asking
+            // check-ignore about the directories above it, so this query set is
+            // completed only once the listing above has run.
+            if let Some(listing) = self.listings.get(root) {
+                let extra: Vec<PathBuf> = listing
+                    .ignored_files
+                    .iter()
+                    .flat_map(|f| ancestors_within(f))
+                    .collect();
+                queries.check_ignore.extend(extra);
+            }
+            self.load_check_ignore(root, &queries.check_ignore)?;
         }
 
         let mut facts = Vec::with_capacity(normalized.len());
@@ -510,8 +552,7 @@ impl Resolver {
         })
     }
 
-    /// Issues the two listings that decide whether a directory's contents are
-    /// wholly ignored, for any scope not already covered.
+    /// Lists the tracked paths under any scope not already covered.
     fn load_listing(&mut self, root: &Path, scopes: &HashSet<PathBuf>) -> Result<(), String> {
         let known = self
             .listings
@@ -524,17 +565,9 @@ impl Resolver {
         }
 
         let mut tracked_args = vec![OsString::from("ls-files"), OsString::from("-z")];
-        let mut untracked_args = vec![
-            OsString::from("ls-files"),
-            OsString::from("-z"),
-            OsString::from("--others"),
-            OsString::from("--exclude-standard"),
-        ];
-        for args in [&mut tracked_args, &mut untracked_args] {
-            args.push(OsString::from("--"));
-            for scope in &fresh {
-                args.push(literal_pathspec(scope));
-            }
+        tracked_args.push(OsString::from("--"));
+        for scope in &fresh {
+            tracked_args.push(literal_pathspec(scope));
         }
 
         let tracked = git(root, &tracked_args)?;
@@ -545,19 +578,57 @@ impl Resolver {
                 tracked.stderr
             ));
         }
-        let untracked = git(root, &untracked_args)?;
-        if !untracked.ok {
+
+        let listing = self.listings.entry(root.to_path_buf()).or_default();
+        listing.tracked.extend(nul_paths(&tracked.stdout));
+        listing.scopes.extend(fresh);
+        Ok(())
+    }
+
+    /// Lists the ignored files under any directory scope not already covered.
+    ///
+    /// `--directory` is deliberately not passed. It collapses a directory into
+    /// a single entry whenever everything inside it happens to be ignored,
+    /// which is the contents-based reading this module does not use: it would
+    /// report a directory nothing ever declared as though it were build output.
+    /// The individual files come back instead, and
+    /// [`Self::holds_irreplaceable_file`] decides which of them are
+    /// reproducible.
+    fn load_ignored_files(&mut self, root: &Path, dirs: &HashSet<PathBuf>) -> Result<(), String> {
+        let known = self
+            .listings
+            .get(root)
+            .map(|l| l.ignored_file_scopes.clone())
+            .unwrap_or_default();
+        let fresh: Vec<PathBuf> = dirs.difference(&known).cloned().collect();
+        if fresh.is_empty() {
+            return Ok(());
+        }
+
+        let mut args = vec![
+            OsString::from("ls-files"),
+            OsString::from("-z"),
+            OsString::from("--others"),
+            OsString::from("--ignored"),
+            OsString::from("--exclude-standard"),
+            OsString::from("--"),
+        ];
+        for dir in &fresh {
+            args.push(literal_pathspec(dir));
+        }
+
+        let out = git(root, &args)?;
+        if !out.ok {
             return Err(format!(
-                "git ls-files --others failed in {}: {}",
+                "git ls-files --ignored failed in {}: {}",
                 root.display(),
-                untracked.stderr
+                out.stderr
             ));
         }
 
         let listing = self.listings.entry(root.to_path_buf()).or_default();
-        listing.tracked.extend(nul_paths(&tracked.stdout));
-        listing.untracked.extend(nul_paths(&untracked.stdout));
-        listing.scopes.extend(fresh);
+        listing.ignored_files.extend(nul_paths(&out.stdout));
+        listing.ignored_file_scopes.extend(fresh);
         Ok(())
     }
 
@@ -631,15 +702,27 @@ impl Resolver {
             listing.tracked.iter().any(|t| t.starts_with(&rel))
         };
 
+        // A directory git reports as ignored grants writes to everything under
+        // it; anything else git ignores is protected. The target's own entry
+        // counts as the former only when it is a directory, so that
+        // `rm -rf target/` is reproducible build output while `rm app.log` is
+        // an irreplaceable file.
+        //
+        // A directory also inherits the latter from what it holds, so that
+        // removing a directory is judged by the same standard as removing the
+        // files inside it one by one. Tracked content takes precedence, which
+        // is what keeps `rm -rf src` an ordinary branch-governed write.
         let ignored = if tracked {
             Ignored::No
         } else if ancestors_within(&rel)
             .iter()
-            .any(|anc| self.dir_contents_all_ignored(&repo.root, listing, anc))
-            || (is_dir && !is_repo_root && self.dir_contents_all_ignored(&repo.root, listing, &rel))
+            .any(|anc| listing.ignored.contains(anc))
+            || (is_dir && !is_repo_root && listing.ignored.contains(&rel))
         {
-            Ignored::ContentsRecursivelyIgnored
-        } else if listing.ignored.contains(&rel) {
+            Ignored::UnderGitignoredDir
+        } else if listing.ignored.contains(&rel)
+            || (is_dir && self.holds_irreplaceable_file(listing, &rel))
+        {
             Ignored::FilePattern
         } else {
             Ignored::No
@@ -656,36 +739,24 @@ impl Resolver {
         }
     }
 
-    /// Every file under this directory is ignored.
+    /// This directory holds an ignored file that nothing can reconstruct.
     ///
-    /// Two independent witnesses, because neither alone is right:
+    /// An ignored file is reproducible when some directory above it is itself
+    /// ignored — that is the build-output case, and `target/debug/app` under an
+    /// ignored `target/` is the standing example. A file with no such ancestor
+    /// has neither history nor a way to regenerate it, and one of those is
+    /// enough to make the directory holding it irreplaceable too.
     ///
-    /// - Nothing under it is tracked and nothing under it is untracked-and-not-
-    ///   ignored. This is the test that works under a deny-all-then-allowlist
-    ///   `.gitignore`, where directories are re-included by `!**/` so that git
-    ///   can descend into them while every file inside stays ignored — there,
-    ///   testing the directory's own path gives the wrong answer.
-    /// - `check-ignore` matches the directory itself. This is what still
-    ///   answers for a `target/` that a `cargo clean` has just emptied.
-    ///
-    /// The first witness requires the directory to exist and to hold something,
-    /// since "every file under it is ignored" is vacuous otherwise. Without
-    /// that requirement a path that does not exist yet would inherit the
-    /// verdict of its own absent parent, and `<repo>/newdir/newfile` would be
-    /// writable on any branch.
-    fn dir_contents_all_ignored(&self, root: &Path, listing: &Listing, rel: &Path) -> bool {
-        if rel.as_os_str().is_empty() {
-            return false;
-        }
-        if listing.ignored.contains(rel) {
-            return true;
-        }
-        let absolute = root.join(rel);
-        if !absolute.is_dir() || is_empty_dir(&absolute) {
-            return false;
-        }
-        !listing.tracked.iter().any(|p| p.starts_with(rel))
-            && !listing.untracked.iter().any(|p| p.starts_with(rel))
+    /// Only the ancestors below `rel` can decide this. An ignored ancestor
+    /// *above* `rel` would have made `rel` itself reproducible, and this
+    /// question would never have been asked.
+    fn holds_irreplaceable_file(&self, listing: &Listing, rel: &Path) -> bool {
+        listing.ignored_files.iter().any(|file| {
+            file.starts_with(rel)
+                && !ancestors_within(file)
+                    .iter()
+                    .any(|anc| listing.ignored.contains(anc))
+        })
     }
 }
 
@@ -754,12 +825,4 @@ fn ancestors_within(rel: &Path) -> Vec<PathBuf> {
         out.push(acc.clone());
     }
     out
-}
-
-/// The directory holds no entries at all.
-fn is_empty_dir(path: &Path) -> bool {
-    match fs::read_dir(path) {
-        Ok(mut entries) => entries.next().is_none(),
-        Err(_) => false,
-    }
 }
