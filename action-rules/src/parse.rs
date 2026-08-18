@@ -21,11 +21,18 @@
 //!   real paths, so resolving it is strictly better than prompting about it.
 //!
 //! What it declares opaque: `$VAR`, `$(…)`, backticks and unbalanced quotes,
-//! wherever they fall in a position that decides a target.
+//! wherever they fall in a position that decides a target; and a known
+//! interpreter whose program it cannot read.
 //!
 //! What it accepts as a limit: a utility it does not know writes nothing. A
 //! script's contents are invisible, and so is `some-tool --output f`. This is
 //! the documented non-goal — completeness — and not a defect.
+//!
+//! The one place that limit is narrowed is [`INTERPRETERS`]: a program given
+//! inline or on stdin (`python3 -c …`, `python3 - <<'EOF'`) is as unreadable as
+//! one in a file, but it travels *in the command*, so the scan can see that
+//! something unreadable is about to run and ask. `bash deploy.sh` cannot be
+//! seen at all and stays under the non-goal above.
 
 use std::{
     collections::BTreeSet,
@@ -425,6 +432,20 @@ fn expand_tilde(word: &str) -> PathBuf {
 /// nowhere on disk once the command has run.
 const FORBIDDEN_UTILITIES: &[&str] = &["chown", "chgrp", "shred"];
 
+/// Interpreters whose inline programs are opaque rather than invisible.
+///
+/// Every one of these can write any path from a few characters of source, with
+/// nothing in the command naming it: `python3 -c "open(p,'w')"` and the same
+/// code fed through a heredoc both scan as a utility with no operands.
+///
+/// `awk` is deliberately absent. Its program is *always* inline, so including
+/// it would ask about every `awk '{print $1}'` in a pipeline — read-only in
+/// practice and frequent enough that the prompt would train its own answer.
+/// The cost of a false ask is paid on every later command, not just this one.
+const INTERPRETERS: &[&str] = &[
+    "python", "python2", "python3", "node", "nodejs", "ruby", "perl", "bash", "sh", "zsh", "dash",
+];
+
 /// How a utility's operands relate to what it writes.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Role {
@@ -533,6 +554,21 @@ fn classify_segment(seg: &Segment) -> SegmentEffect {
 
     if name == "git" {
         classify_git(seg, args, &mut eff);
+        return eff;
+    }
+
+    // An interpreter told to run source the scan cannot read. Checked before
+    // the role table because the role table would find no operands and call it
+    // read-only, which is how a heredoc came to write a tracked file on a
+    // branch the rules protect.
+    //
+    // `perl -i` is left to the table below, which knows exactly which files it
+    // rewrites; only a perl that is not editing in place reaches this.
+    if INTERPRETERS.contains(&name)
+        && !(name == "perl" && has_in_place_flag(args))
+        && let Some(why) = unreadable_program(name, args)
+    {
+        eff.opaque = Some(format!("`{name}` runs a program {why}"));
         return eff;
     }
 
@@ -672,6 +708,57 @@ fn takes_operand(utility: &str, flag: &str) -> bool {
         "truncate" => matches!(flag, "-s" | "--size" | "-r" | "--reference"),
         "chmod" => matches!(flag, "--reference"),
         _ => false,
+    }
+}
+
+/// The short flag letters meaning "the program follows, as text".
+///
+/// Per interpreter, because the same letter is a different option in each:
+/// `-e` is eval for perl and ruby but errexit for a shell, and `-c` is the
+/// program for a shell but a syntax check for perl and ruby. Reading them from
+/// one shared set would ask about `bash -e script.sh`, which names its file.
+fn inline_program_flags(interpreter: &str) -> &'static str {
+    match interpreter {
+        "bash" | "sh" | "zsh" | "dash" => "c",
+        "perl" => "eE",
+        "ruby" => "e",
+        "node" | "nodejs" => "ep",
+        // The python family, and anything added to INTERPRETERS without a case.
+        _ => "c",
+    }
+}
+
+/// Why an interpreter's program cannot be read, or `None` when it names a
+/// script file — the case the completeness non-goal already covers.
+fn unreadable_program(interpreter: &str, args: &[&Tok]) -> Option<String> {
+    // `python3 --version` runs no program at all, and asking about it would be
+    // the pure noise the awk note warns of.
+    if args
+        .iter()
+        .any(|a| matches!(a.text.as_str(), "--version" | "--help" | "-V" | "-h"))
+    {
+        return None;
+    }
+
+    let letters = inline_program_flags(interpreter);
+    for a in args {
+        if matches!(a.text.as_str(), "--eval" | "--print" | "--command") {
+            return Some("given inline".to_owned());
+        }
+        // `-` is stdin, not a flag; long flags carry no clustered letters.
+        if a.text == "-" || a.text.starts_with("--") || !a.text.starts_with('-') {
+            continue;
+        }
+        // Clustered short flags count: `-Ec`, `-pe`.
+        if a.text.chars().skip(1).any(|c| letters.contains(c)) {
+            return Some("given inline".to_owned());
+        }
+    }
+
+    // No script operand at all means stdin: `python3 - <<'EOF'`, `… | python3`.
+    match positional(args, interpreter).first() {
+        Some(first) if first.text != "-" => None,
+        _ => Some("read from stdin".to_owned()),
     }
 }
 

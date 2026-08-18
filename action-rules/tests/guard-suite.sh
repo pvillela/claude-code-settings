@@ -370,6 +370,40 @@ run "$D" "$D" 'cat > tracked.txt <<EOF
 hi
 EOF' deny
 
+echo "== An interpreter's inline program is opaque, not read-only =="
+# The hole this closes: the path lives in the heredoc body, which the scan
+# discards, and python3 is not in the role table -- so the write was invisible,
+# the segment scanned as read-only, and the branch rule never saw a target to
+# refuse. Opaque asks on the allowed branch too: the point is that nobody can
+# tell what it writes, which the branch does not change.
+run "$D" "$D" 'python3 - <<EOF
+open("tracked.txt","w").write("x")
+EOF' ask
+run "$D" "$D" 'python3 -c "open(1,2)"' ask
+run "$A" "$A" 'python3 -c "open(1,2)"' ask
+run "$D" "$D" 'node -e "require(1)"' ask
+run "$D" "$D" 'bash -c "rm -rf x"' ask
+run "$D" "$D" 'perl -e "open F"' ask
+run "$D" "$D" 'cat x | python3' ask
+
+echo "== ... but a script FILE stays the documented non-goal =="
+run "$D" "$D" 'python3 script.py' allow
+run "$D" "$D" 'bash deploy.sh' allow
+run "$D" "$D" 'bash -e deploy.sh' allow
+run "$D" "$D" 'ruby -c script.rb' allow
+
+echo "== ... and a probe that runs no program is not a program =="
+run "$D" "$D" 'python3 --version' allow
+run "$D" "$D" 'python3 -V' allow
+run "$D" "$D" 'python3 -m pip list' allow
+
+echo "== awk is deliberately out: its program is always inline =="
+run "$D" "$D" 'ps aux | awk "{print \$1}"' allow
+
+echo "== perl -i keeps its precise verdict rather than degrading to ask =="
+run "$D" "$D" 'perl -pi -e s/a/b/ tracked.txt' deny
+run "$A" "$A" 'perl -pi -e s/a/b/ tracked.txt' allow
+
 # =============================================================================
 echo
 echo "== GitAction::ConfigWrite: denied at every scope, on every branch =="
