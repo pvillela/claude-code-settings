@@ -11,6 +11,7 @@
 !CLAUDE.md
 !action-guard.sh
 !LICENSE
+!ra-rename.py
 !README.md
 !rustfmt-on-edit.sh
 !uncommitted-at-start.sh
